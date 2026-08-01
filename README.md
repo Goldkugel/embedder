@@ -24,6 +24,7 @@ A flexible, configuration-driven Python library designed to encode textual terms
     ├── EmbedderConfig.py    # Pydantic configuration schema
     ├── Embedder.py          # Primary embedding engine class
     └── EmbedderTest.py      # Pytest unit tests for Embedder initialization and execution
+``
 
 Requirements & Installation
 
