@@ -1,5 +1,5 @@
 [project]
-name = "embeder"
+name = "embedder"
 version = "1.0.0"
 dependencies = [
     "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.5"
