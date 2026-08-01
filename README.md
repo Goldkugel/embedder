@@ -16,7 +16,7 @@ A flexible, configuration-driven Python library designed to encode textual terms
 
 ## Repository Structure
 
-```text
+```
 .
 ├── config/
 │   └── config.yaml          # Default configuration file containing 'embedder' settings
@@ -24,7 +24,7 @@ A flexible, configuration-driven Python library designed to encode textual terms
     ├── EmbedderConfig.py    # Pydantic configuration schema
     ├── Embedder.py          # Primary embedding engine class
     └── EmbedderTest.py      # Pytest unit tests for Embedder initialization and execution
-``
+```
 
 Requirements & Installation
 
