@@ -1,5 +1,3 @@
-Markdown
-
 # Term Embedding Engine
 
 A flexible, configuration-driven Python library designed to encode textual terms, clinical concepts, and domain terminologies into dense vector embeddings with built-in post-processing and dimensionality reduction.
