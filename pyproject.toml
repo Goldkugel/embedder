@@ -9,8 +9,8 @@ dependencies = [
     "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6"
 ]
 
+[tool.setuptools]
+packages = ["embedder"]
+
 [tool.setuptools.package-dir]
 "embedder" = "src"
-
-[tool.setuptools]
-py-modules = ["Embedder", "EmbedderConfig"]
