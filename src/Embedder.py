@@ -5,8 +5,8 @@ sys.dont_write_bytecode = True
 
 from sentence_transformers      import SentenceTransformer
 from typing                     import List, Union, Dict, Optional
-from EmbedderConfig             import EmbedderConfig
-from Logger                     import Logger
+from .EmbedderConfig            import EmbedderConfig
+from logger                     import Logger
 import numpy                    as np
 import umap
 import yaml
@@ -15,7 +15,7 @@ import yaml
 configuration_section: str  = "embedder"
 
 # Default path to the config file, used if no path is explicitly passed in.
-standard_directory: str     = "../config/config.yaml"
+standard_directory: str     = "./config/config.yaml"
 
 class Embedder:
     """

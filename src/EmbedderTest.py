@@ -4,254 +4,246 @@ import sys
 sys.dont_write_bytecode = True
 
 import os
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-
+import yaml
 import pytest
 import numpy as np
 from unittest.mock import MagicMock, patch
 
-from Embedder import Embedder
-from EmbedderConfig import EmbedderConfig
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from .Embedder import Embedder
+
+# Resolve the actual module object Embedder lives in via sys.modules,
+# rather than building a dotted string like "src.Embedder" for @patch to
+# resolve via attribute lookup. The latter breaks here: this package's
+# __init__.py does `from .Embedder import Embedder`, which rebinds the
+# name "Embedder" inside the src package's namespace from "the submodule"
+# to "the class" (since the module file and the class share the same
+# name) - so patch("src.Embedder.SentenceTransformer") ends up resolving
+# "src.Embedder" to the class, not the module, and fails to find
+# SentenceTransformer on it. sys.modules[...] always returns the true
+# module object regardless of that shadowing.
+_EMBEDDER_MODULE = sys.modules[Embedder.__module__]
 
 
-@pytest.fixture
-def create_yaml_config(tmp_path):
-    """Helper fixture to write YAML string content to a temporary file."""
-    def _create(yaml_content: str) -> str:
-        config_file = tmp_path / "config.yaml"
-        config_file.write_text(yaml_content, encoding="utf-8")
-        return str(config_file)
-    return _create
-
-
-@pytest.fixture
-def standard_yaml_str():
-    """Return a standard raw YAML configuration string with multiple models."""
-    return """
-embedder:
-  model_id:
-    - "mock/model-a"
-    - "mock/model-b"
-  device: "cpu"
-  batch_size: 32
-  max_seq_length: 64
-  normalization: true
-  dimensionality_reduction: true
-  n_components: 2
-  n_neighbors: 5
-  min_dist: 0.2
-  metric: "cosine"
-  random_state: 42
-"""
-
-
-@pytest.fixture
-def single_model_yaml_str():
-    """Return a YAML configuration string with a single model."""
-    return """
-embedder:
-  model_id:
-    - "mock/model-a"
-  device: "cpu"
-  batch_size: 32
-  max_seq_length: 64
-  normalization: true
-  dimensionality_reduction: true
-  n_components: 2
-  n_neighbors: 5
-  min_dist: 0.2
-  metric: "cosine"
-  random_state: 42
-"""
+def _write_config(tmp_path, **overrides):
+    """
+    Write an 'embedder' section config YAML to a temp file, with
+    sensible defaults for every field Embedder.py reads, overridden by
+    whatever the caller passes in.
+    """
+    cfg = {
+        "model_id": ["fake/test-model"],
+        "device": "cpu",
+        "batch_size": 64,
+        "max_seq_length": 128,
+        "normalization": True,
+        "dimensionality_reduction": False,
+        "n_components": 2,
+        "n_neighbors": 5,
+        "min_dist": 0.2,
+        "metric": "cosine",
+        "random_state": 42,
+    }
+    cfg.update(overrides)
+    path = tmp_path / "config.yaml"
+    with open(path, "w") as f:
+        yaml.safe_dump({"embedder": cfg}, f)
+    return str(path)
 
 
 class TestEmbedderInit:
 
-    @patch("Embedder.Logger")
-    @patch("Embedder.umap.UMAP")
-    @patch("Embedder.SentenceTransformer")
-    def test_init_loads_config_and_initializes_models(
-        self, mock_sentence_transformer, mock_umap, mock_logger, create_yaml_config, standard_yaml_str
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_loads_each_configured_model(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=["model-a", "model-b"])
+        mock_st.side_effect = lambda model_id, device: MagicMock(name=model_id)
+
+        embedder = Embedder(config=config_path)
+
+        assert mock_st.call_count == 2
+        assert set(embedder.models.keys()) == {"model-a", "model-b"}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_passes_configured_device_to_each_model(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=["model-a"], device="cuda")
+        mock_st.return_value = MagicMock()
+
+        Embedder(config=config_path)
+
+        mock_st.assert_called_once_with("model-a", device="cuda")
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_sets_max_seq_length_on_each_loaded_model(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=["model-a"], max_seq_length=256)
+        fake_model = MagicMock()
+        mock_st.return_value = fake_model
+
+        embedder = Embedder(config=config_path)
+
+        assert fake_model.max_seq_length == 256
+        assert embedder.models["model-a"] is fake_model
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_with_no_configured_models_leaves_models_empty(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=[])
+
+        embedder = Embedder(config=config_path)
+
+        assert embedder.models == {}
+        mock_st.assert_not_called()
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_creates_a_reducer_when_dimensionality_reduction_enabled(
+        self, mock_st, mock_umap, tmp_path
     ):
-        config_path = create_yaml_config(standard_yaml_str)
-        mock_sentence_transformer.side_effect = lambda model_id, device=None: MagicMock()
-
-        embedder = Embedder(config_path)
-
-        assert isinstance(embedder.config, EmbedderConfig)
-        assert embedder.config.model_id == ["mock/model-a", "mock/model-b"]
-        assert len(embedder.models) == 2
-        assert "mock/model-a" in embedder.models
-        assert "mock/model-b" in embedder.models
-        assert mock_sentence_transformer.call_count == 2
-
-    @patch("Embedder.Logger")
-    @patch("Embedder.umap.UMAP")
-    @patch("Embedder.SentenceTransformer")
-    def test_init_sets_max_seq_length_on_loaded_models(
-        self, mock_sentence_transformer, mock_umap, mock_logger, create_yaml_config, standard_yaml_str
-    ):
-        config_path = create_yaml_config(standard_yaml_str)
-        mock_sentence_transformer.side_effect = lambda model_id, device=None: MagicMock()
-
-        embedder = Embedder(config_path)
-
-        assert len(embedder.models) == 2
-        for model_id, model_obj in embedder.models.items():
-            assert model_obj.max_seq_length == 64
-
-    @patch("Embedder.Logger")
-    @patch("Embedder.umap.UMAP")
-    @patch("Embedder.SentenceTransformer")
-    def test_init_initializes_umap_reducer_when_reduction_is_enabled(
-        self, mock_sentence_transformer, mock_umap, mock_logger, create_yaml_config, single_model_yaml_str
-    ):
-        config_path = create_yaml_config(single_model_yaml_str)
-
-        embedder = Embedder(config_path)
-
-        assert embedder.reducer is not None
-        mock_umap.assert_called_once_with(
-            n_components=2,
-            n_neighbors=5,
-            min_dist=0.2,
-            metric="cosine",
-            random_state=42,
+        mock_st.return_value = MagicMock()
+        config_path = _write_config(
+            tmp_path,
+            model_id=["model-a"],
+            dimensionality_reduction=True,
+            n_components=3,
+            n_neighbors=10,
+            min_dist=0.5,
+            metric="euclidean",
+            random_state=7,
         )
 
-    @patch("Embedder.Logger")
-    @patch("Embedder.SentenceTransformer")
-    def test_init_skips_reducer_when_dimensionality_reduction_is_false(
-        self, mock_sentence_transformer, mock_logger, create_yaml_config
-    ):
-        yaml_no_reduction = """
-embedder:
-  model_id: ["mock/model-a"]
-  dimensionality_reduction: false
-"""
-        config_path = create_yaml_config(yaml_no_reduction)
+        embedder = Embedder(config=config_path)
 
-        embedder = Embedder(config_path)
+        mock_umap.UMAP.assert_called_once_with(
+            n_components=3,
+            n_neighbors=10,
+            min_dist=0.5,
+            metric="euclidean",
+            random_state=7,
+        )
+        assert embedder.reducer is mock_umap.UMAP.return_value
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_does_not_create_a_reducer_when_dimensionality_reduction_disabled(
+        self, mock_st, tmp_path
+    ):
+        mock_st.return_value = MagicMock()
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=False
+        )
+
+        embedder = Embedder(config=config_path)
 
         assert embedder.reducer is None
 
-    @patch("Embedder.Logger")
-    def test_init_handles_empty_model_id_list(
-        self, mock_logger, create_yaml_config
-    ):
-        yaml_no_models = """
-embedder:
-  model_id: []
-"""
-        config_path = create_yaml_config(yaml_no_models)
 
-        embedder = Embedder(config_path)
+class TestEmbed:
 
-        assert len(embedder.models) == 0
-        assert embedder.reducer is None
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_calls_encode_with_configured_parameters(self, mock_st, tmp_path):
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.zeros((2, 4))
+        mock_st.return_value = fake_model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], batch_size=16, normalization=False
+        )
+        embedder = Embedder(config=config_path)
 
+        embedder.embed(["term one", "term two"])
 
-class TestEmbedderEmbed:
-
-    @patch("Embedder.Logger")
-    @patch("Embedder.umap.UMAP")
-    @patch("Embedder.SentenceTransformer")
-    def test_embed_returns_embeddings_dictionary_for_all_configured_models(
-        self, mock_sentence_transformer, mock_umap, mock_logger, create_yaml_config, standard_yaml_str
-    ):
-        config_path = create_yaml_config(standard_yaml_str)
-
-        # Create distinct mock models for each model entry
-        def create_mock_model(model_id, device=None):
-            m = MagicMock()
-            m.encode.return_value = np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]])
-            return m
-
-        mock_sentence_transformer.side_effect = create_mock_model
-
-        # Mock UMAP fit_transform behavior
-        mock_reducer = MagicMock()
-        mock_reducer.fit_transform.return_value = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
-        mock_umap.return_value = mock_reducer
-
-        embedder = Embedder(config_path)
-        sample_terms = ["term_1", "term_2", "term_3"]
-
-        results = embedder.embed(sample_terms)
-
-        assert isinstance(results, dict)
-        assert set(results.keys()) == {"mock/model-a", "mock/model-b"}
-        assert results["mock/model-a"].shape == (3, 2)
-        assert results["mock/model-b"].shape == (3, 2)
-
-    @patch("Embedder.Logger")
-    @patch("Embedder.SentenceTransformer")
-    def test_embed_passes_configured_batch_size_and_normalization_to_model(
-        self, mock_sentence_transformer, mock_logger, create_yaml_config
-    ):
-        yaml_str = """
-embedder:
-  model_id: ["mock/model-a"]
-  batch_size: 16
-  normalization: true
-  dimensionality_reduction: false
-"""
-        config_path = create_yaml_config(yaml_str)
-        mock_model = MagicMock()
-        mock_sentence_transformer.return_value = mock_model
-
-        embedder = Embedder(config_path)
-        embedder.embed(["term_1", "term_2"])
-
-        mock_model.encode.assert_called_once_with(
-            ["term_1", "term_2"],
+        fake_model.encode.assert_called_once_with(
+            ["term one", "term two"],
             batch_size=16,
             show_progress_bar=False,
-            normalize_embeddings=True,
+            normalize_embeddings=False,
             convert_to_numpy=True,
         )
 
-    @patch("Embedder.Logger")
-    @patch("Embedder.umap.UMAP")
-    @patch("Embedder.SentenceTransformer")
-    def test_embed_skips_reduction_if_sample_count_is_less_than_or_equal_to_n_components(
-        self, mock_sentence_transformer, mock_umap, mock_logger, create_yaml_config, single_model_yaml_str
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_returns_one_entry_per_model(self, mock_st, tmp_path):
+        model_a = MagicMock()
+        model_a.encode.return_value = np.ones((3, 4))
+        model_b = MagicMock()
+        model_b.encode.return_value = np.zeros((3, 4))
+        mock_st.side_effect = [model_a, model_b]
+        config_path = _write_config(tmp_path, model_id=["model-a", "model-b"])
+        embedder = Embedder(config=config_path)
+
+        result = embedder.embed(["a", "b", "c"])
+
+        assert set(result.keys()) == {"model-a", "model-b"}
+        np.testing.assert_array_equal(result["model-a"], model_a.encode.return_value)
+        np.testing.assert_array_equal(result["model-b"], model_b.encode.return_value)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_with_no_loaded_models_returns_empty_dict(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=[])
+        embedder = Embedder(config=config_path)
+
+        assert embedder.embed(["term"]) == {}
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_applies_reducer_when_enabled_and_term_count_exceeds_n_components(
+        self, mock_st, mock_umap, tmp_path
     ):
-        config_path = create_yaml_config(single_model_yaml_str)
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.ones((5, 384))
+        mock_st.return_value = fake_model
+        fake_reducer = MagicMock()
+        fake_reducer.fit_transform.return_value = np.ones((5, 2))
+        mock_umap.UMAP.return_value = fake_reducer
 
-        # Return 2 samples when n_components is 2 (len(embeddings) <= n_components)
-        mock_model = MagicMock()
-        raw_embeddings = np.array([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]])
-        mock_model.encode.return_value = raw_embeddings
-        mock_sentence_transformer.return_value = mock_model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=True, n_components=2
+        )
+        embedder = Embedder(config=config_path)
 
-        mock_reducer = MagicMock()
-        mock_umap.return_value = mock_reducer
+        result = embedder.embed(["a", "b", "c", "d", "e"])
 
-        embedder = Embedder(config_path)
-        results = embedder.embed(["term_1", "term_2"])
+        fake_reducer.fit_transform.assert_called_once()
+        np.testing.assert_array_equal(
+            result["model-a"], fake_reducer.fit_transform.return_value
+        )
 
-        # fit_transform should NOT be called because sample count (2) <= n_components (2)
-        mock_reducer.fit_transform.assert_not_called()
-        np.testing.assert_array_equal(results["mock/model-a"], raw_embeddings)
-
-    @patch("Embedder.Logger")
-    def test_embed_returns_empty_dict_when_no_models_are_configured(
-        self, mock_logger, create_yaml_config
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_skips_reducer_when_term_count_does_not_exceed_n_components(
+        self, mock_st, mock_umap, tmp_path
     ):
-        yaml_no_models = """
-embedder:
-  model_id: []
-"""
-        config_path = create_yaml_config(yaml_no_models)
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.ones((2, 384))
+        mock_st.return_value = fake_model
+        fake_reducer = MagicMock()
+        mock_umap.UMAP.return_value = fake_reducer
 
-        embedder = Embedder(config_path)
-        results = embedder.embed(["term_1", "term_2"])
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=True, n_components=2
+        )
+        embedder = Embedder(config=config_path)
 
-        assert results == {}
+        # Exactly 2 terms == n_components, and the code requires
+        # len(embeddings) > n_components (strictly greater), so the
+        # reducer should NOT be applied here.
+        result = embedder.embed(["a", "b"])
+
+        fake_reducer.fit_transform.assert_not_called()
+        np.testing.assert_array_equal(result["model-a"], fake_model.encode.return_value)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_does_not_apply_reducer_when_dimensionality_reduction_disabled(
+        self, mock_st, tmp_path
+    ):
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.ones((10, 384))
+        mock_st.return_value = fake_model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=False
+        )
+        embedder = Embedder(config=config_path)
+
+        result = embedder.embed(["a"] * 10)
+
+        np.testing.assert_array_equal(result["model-a"], fake_model.encode.return_value)
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(pytest.main([__file__, "-v"]))
