@@ -2,7 +2,7 @@
 name = "embedder"
 version = "1.0.2"
 dependencies = [
-    "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.5"
+    "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6"
 ]
 
 [tool.setuptools.package-dir]
