@@ -82,9 +82,15 @@ class Embedder:
             of embedding in the same order as the terms.
         """
         ret = {}
-        if len(self.models.keys()) > 0:
+        if len(self.models.keys()) > 0 and terms and len(terms) > 0:
             for model_name in self.models.keys():
                 model = self.models[model_name]
+
+                for index in range(0, len(terms)):
+                    if not terms[index]:
+                        terms[index] = ""
+                    else:
+                        terms[index] = str(terms[index])
 
                 # Generate embeddings
                 embeddings = model.encode(

@@ -60,3 +60,16 @@ llm:
   max_tokens: 2048
   prompt_log_folder: "./data/logs/"
   prompt_log_file: "prompts.log"
+embedder: 
+  model_id:
+    - ""
+  device: "cpu"
+  batch_size: 128
+  max_seq_length: 128
+  normalization: True
+  dimensionality_reduction: True
+  n_components: 2
+  n_neighbors: 25
+  min_dist: 0.2
+  metric: "cosine"
+  random_state: 253
