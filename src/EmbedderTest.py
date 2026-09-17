@@ -1,15 +1,30 @@
+"""
+Test suite for the Embedder class and EmbedderConfig model.
+
+Tests cover:
+- __init__: model loading, device assignment, max_seq_length, empty model
+  list, reducer creation when dimensionality reduction is enabled/disabled.
+- embed(): encode parameters, per-model output, empty model list,
+  reducer applied when term count exceeds n_components, reducer skipped
+  when term count does not exceed n_components, reducer skipped when
+  dimensionality reduction is disabled.
+
+Run with:
+    pytest src/EmbedderTest.py -v
+
+Run from the repository root so that the default config path
+(./config/config.yaml) resolves correctly.
+"""
+
+from __future__ import annotations
+
 import sys
-
-# Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode = True
-
 import os
-import yaml
-import pytest
-import numpy as np
-from unittest.mock import MagicMock, patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import numpy  as np
+import pytest
+import yaml
+from unittest.mock import MagicMock, patch
 
 from .Embedder import Embedder
 
@@ -19,7 +34,7 @@ from .Embedder import Embedder
 # __init__.py does `from .Embedder import Embedder`, which rebinds the
 # name "Embedder" inside the src package's namespace from "the submodule"
 # to "the class" (since the module file and the class share the same
-# name) - so patch("src.Embedder.SentenceTransformer") ends up resolving
+# name) — so patch("src.Embedder.SentenceTransformer") ends up resolving
 # "src.Embedder" to the class, not the module, and fails to find
 # SentenceTransformer on it. sys.modules[...] always returns the true
 # module object regardless of that shadowing.
@@ -28,22 +43,34 @@ _EMBEDDER_MODULE = sys.modules[Embedder.__module__]
 
 def _write_config(tmp_path, **overrides):
     """
-    Write an 'embedder' section config YAML to a temp file, with
-    sensible defaults for every field Embedder.py reads, overridden by
+    Write an "embedder" section config YAML to a temp file, with
+    sensible defaults for every field Embedder reads, overridden by
     whatever the caller passes in.
+
+    Parameters
+    ----------
+    tmp_path : pathlib.Path
+        Pytest-provided temporary directory to write the config into.
+    **overrides
+        Any EmbedderConfig field to override from the defaults.
+
+    Returns
+    -------
+    str
+        Absolute path to the written config file.
     """
     cfg = {
-        "model_id": ["fake/test-model"],
-        "device": "cpu",
-        "batch_size": 64,
-        "max_seq_length": 128,
-        "normalization": True,
+        "model_id"                : ["fake/test-model"],
+        "device"                  : "cpu",
+        "batch_size"              : 64,
+        "max_seq_length"          : 128,
+        "normalization"           : True,
         "dimensionality_reduction": False,
-        "n_components": 2,
-        "n_neighbors": 5,
-        "min_dist": 0.2,
-        "metric": "cosine",
-        "random_state": 42,
+        "n_components"            : 2,
+        "n_neighbors"             : 5,
+        "min_dist"                : 0.2,
+        "metric"                  : "cosine",
+        "random_state"            : 42,
     }
     cfg.update(overrides)
     path = tmp_path / "config.yaml"
@@ -53,6 +80,13 @@ def _write_config(tmp_path, **overrides):
 
 
 class TestEmbedderInit:
+    """
+    Tests for Embedder.__init__.
+
+    Verifies that models are loaded with the correct parameters, that the
+    UMAP reducer is created only when dimensionality_reduction is True, and
+    that an empty model list results in no SentenceTransformer calls.
+    """
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_loads_each_configured_model(self, mock_st, tmp_path):
@@ -98,26 +132,30 @@ class TestEmbedderInit:
     def test_init_creates_a_reducer_when_dimensionality_reduction_enabled(
         self, mock_st, mock_umap, tmp_path
     ):
+        """
+        When dimensionality_reduction is True, UMAP must be constructed
+        with the exact parameters from the config.
+        """
         mock_st.return_value = MagicMock()
         config_path = _write_config(
             tmp_path,
-            model_id=["model-a"],
-            dimensionality_reduction=True,
-            n_components=3,
-            n_neighbors=10,
-            min_dist=0.5,
-            metric="euclidean",
-            random_state=7,
+            model_id              = ["model-a"],
+            dimensionality_reduction = True,
+            n_components          = 3,
+            n_neighbors           = 10,
+            min_dist              = 0.5,
+            metric                = "euclidean",
+            random_state          = 7,
         )
 
         embedder = Embedder(config=config_path)
 
         mock_umap.UMAP.assert_called_once_with(
-            n_components=3,
-            n_neighbors=10,
-            min_dist=0.5,
-            metric="euclidean",
-            random_state=7,
+            n_components = 3,
+            n_neighbors  = 10,
+            min_dist     = 0.5,
+            metric       = "euclidean",
+            random_state = 7,
         )
         assert embedder.reducer is mock_umap.UMAP.return_value
 
@@ -136,6 +174,14 @@ class TestEmbedderInit:
 
 
 class TestEmbed:
+    """
+    Tests for Embedder.embed().
+
+    Verifies that encode() is called with the correct parameters, that
+    results are keyed by model ID, that the reducer is applied only when
+    the term count strictly exceeds n_components, and that an empty model
+    registry or an empty terms list returns an empty dict.
+    """
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_calls_encode_with_configured_parameters(self, mock_st, tmp_path):
@@ -151,10 +197,10 @@ class TestEmbed:
 
         fake_model.encode.assert_called_once_with(
             ["term one", "term two"],
-            batch_size=16,
-            show_progress_bar=False,
-            normalize_embeddings=False,
-            convert_to_numpy=True,
+            batch_size           = 16,
+            show_progress_bar    = False,
+            normalize_embeddings = False,
+            convert_to_numpy     = True,
         )
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -209,6 +255,10 @@ class TestEmbed:
     def test_embed_skips_reducer_when_term_count_does_not_exceed_n_components(
         self, mock_st, mock_umap, tmp_path
     ):
+        """
+        UMAP requires strictly more input points than n_components. Exactly
+        n_components terms must not trigger the reducer.
+        """
         fake_model = MagicMock()
         fake_model.encode.return_value = np.ones((2, 384))
         mock_st.return_value = fake_model
@@ -220,9 +270,8 @@ class TestEmbed:
         )
         embedder = Embedder(config=config_path)
 
-        # Exactly 2 terms == n_components, and the code requires
-        # len(embeddings) > n_components (strictly greater), so the
-        # reducer should NOT be applied here.
+        # Exactly 2 terms == n_components; the guard uses strict greater-than,
+        # so the reducer must NOT be applied here.
         result = embedder.embed(["a", "b"])
 
         fake_reducer.fit_transform.assert_not_called()

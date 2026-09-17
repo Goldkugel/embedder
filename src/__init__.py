@@ -1,9 +1,11 @@
-import sys
+"""
+Embedder package.
 
-# Prevent Python from generating .pyc files (compiled bytecode files)
-sys.dont_write_bytecode = True
+Exports the Embedder class and its EmbedderConfig Pydantic model for use
+by the adapter framework and any other consumers of this package.
+"""
 
-from .Embedder import Embedder
+from .Embedder       import Embedder
 from .EmbedderConfig import EmbedderConfig
 
 __all__ = ["Embedder", "EmbedderConfig"]
