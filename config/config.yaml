@@ -62,7 +62,7 @@ llm:
   prompt_log_file: "prompts.log"
 embedder: 
   model_id:
-    - ""
+    - "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
   device: "cpu"
   batch_size: 128
   max_seq_length: 128

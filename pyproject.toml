@@ -4,10 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embedder"
-version = "1.1.0"
+version = "1.2.0"
+requires-python = ">=3.10"
 dependencies = [
-    "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6"
+    "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6",
+    "numpy",
+    "pydantic>=2",
+    "PyYAML",
+    "sentence-transformers",
+    "umap-learn",
 ]
+
+[project.optional-dependencies]
+test = ["pytest"]
 
 [tool.setuptools]
 packages = ["embedder"]

@@ -9,9 +9,11 @@ reduction to the resulting embeddings.
 
 from __future__ import annotations
 
+from collections.abc       import Iterable
 from sentence_transformers import SentenceTransformer
 from .EmbedderConfig       import EmbedderConfig
 from logger                import Logger
+import math
 import yaml
 import umap
 
@@ -22,6 +24,17 @@ configuration_section: str = "embedder"
 standard_directory: str    = "./config/config.yaml"
 
 
+def _to_text(term) -> str:
+    """
+    Coerce a single term to a string for the model. None and NaN (e.g.
+    missing values from a pandas column) become an empty string; every
+    other value, including falsy ones like 0 or False, keeps its string form.
+    """
+    if term is None or (isinstance(term, float) and math.isnan(term)):
+        return ""
+    return str(term)
+
+
 class Embedder:
     """
     Core embedding engine responsible for encoding textual terms into dense
@@ -30,32 +43,54 @@ class Embedder:
     One or more SentenceTransformer models are loaded at construction time.
     Each call to embed() runs all loaded models and returns their outputs as
     a dictionary keyed by model ID. If dimensionality reduction is enabled,
-    UMAP is applied to each model's output before it is returned.
+    each model has its own UMAP reducer, which is fitted afresh on every
+    embed() call. Reduced coordinates are therefore only comparable within
+    the output of a single call, not across calls.
     """
 
     def __init__(self, config: str = standard_directory):
         """
         Load and validate configuration, then initialise all configured
-        SentenceTransformer models and (if enabled) the UMAP reducer.
+        SentenceTransformer models and (if enabled) one UMAP reducer per model.
 
         Parameters
         ----------
         config : str, optional
             Path to the YAML configuration file. Defaults to
             ./config/config.yaml relative to the working directory.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the configuration file does not exist.
+        ValueError
+            If the configuration file has no "embedder" section.
+        pydantic.ValidationError
+            If the "embedder" section contains unknown keys or invalid values.
         """
         # Initialise instance attributes explicitly so each Embedder instance
-        # has its own model registry and reducer, rather than sharing
+        # has its own model and reducer registries, rather than sharing
         # class-level mutable defaults.
-        self.models : dict = {}
-        self.reducer       = None
+        self.models   : dict = {}
+        self.reducers : dict = {}
 
         # Load and validate configuration from the YAML file.
-        with open(config, "r") as f:
-            data = yaml.safe_load(f)
-        self.config = EmbedderConfig.model_validate(data[configuration_section])
+        # An empty file parses to None, so fall back to an empty dict to get
+        # the clearer "missing section" error below instead of a TypeError.
+        with open(config, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if configuration_section not in data:
+            raise ValueError(
+                f"Configuration file '{config}' has no '{configuration_section}' section."
+            )
+        # A section that is present but empty (`embedder:` with nothing
+        # below it) also parses to None; treat it as "use all defaults".
+        self.config = EmbedderConfig.model_validate(data[configuration_section] or {})
 
-        l = Logger()
+        # The logger is a process-wide singleton. If the entry point has not
+        # configured it yet, configure it from the same file as the embedder
+        # instead of falling back to ./config/config.yaml.
+        l = Logger() if Logger.config is not None else Logger(config)
         l.log("Loading model(s)...")
 
         if self.config.model_id:
@@ -73,37 +108,41 @@ class Embedder:
                 l.log(f"Loading embedding model '{model_id}' on device '{self.config.device}' completed.")
 
             if self.config.dimensionality_reduction:
-                # Initialise the UMAP reducer with the configured parameters.
-                # The reducer is fitted lazily inside embed() (via fit_transform),
-                # so it learns the manifold structure from each batch of embeddings
-                # rather than from a separate training set.
-                l.log("Loading reducer...")
-                self.reducer = umap.UMAP(
-                    n_components = self.config.n_components,
-                    n_neighbors  = self.config.n_neighbors,
-                    min_dist     = self.config.min_dist,
-                    metric       = self.config.metric,
-                    random_state = self.config.random_state,
-                )
-                l.log("Loading reducer completed.")
+                # Initialise one UMAP reducer per model with the configured
+                # parameters, so fitting on one model's embeddings never
+                # overwrites the fitted state belonging to another model.
+                # Each reducer is fitted inside embed() (via fit_transform).
+                l.log("Loading reducer(s)...")
+                for model_id in self.models:
+                    self.reducers[model_id] = umap.UMAP(
+                        n_components = self.config.n_components,
+                        n_neighbors  = self.config.n_neighbors,
+                        min_dist     = self.config.min_dist,
+                        metric       = self.config.metric,
+                        random_state = self.config.random_state,
+                    )
+                l.log("Loading reducer(s) completed.")
         else:
             l.log("No model specified.")
 
         l.log("Loading model(s) completed.")
 
-    def embed(self, terms: list) -> dict:
+    def embed(self, terms: str | Iterable) -> dict:
         """
-        Encode a list of text terms into dense vector embeddings.
+        Encode a sequence of text terms into dense vector embeddings.
 
         Each loaded model produces one set of embeddings. If dimensionality
-        reduction is enabled and the number of terms exceeds `n_components`,
-        UMAP is applied to reduce each model's output before it is returned.
+        reduction is enabled, UMAP is applied to each model's output, provided
+        there are at least `n_components + 2` terms (UMAP's spectral
+        initialisation fails on fewer points). With fewer terms, the
+        full-dimensional embeddings are returned and a message is logged.
 
         Parameters
         ----------
-        terms : list
-            List of text strings to embed. Non-string and None values are
-            coerced to strings; None is converted to an empty string.
+        terms : str or Iterable
+            Text strings to embed — a list, tuple, numpy array or pandas
+            Series. A single string is treated as one term. None and NaN
+            become an empty string; any other value is converted with str().
 
         Returns
         -------
@@ -115,10 +154,18 @@ class Embedder:
         """
         ret = {}
 
+        # Materialise the input as a plain list so numpy arrays and pandas
+        # Series work too (their truth value is ambiguous in an `if`). A bare
+        # string is wrapped first, since list("abc") would split it into
+        # single characters and embed each one separately.
+        if isinstance(terms, str):
+            terms = [terms]
+        terms = list(terms) if terms is not None else []
+
         if self.models and terms:
             # Coerce all term values to strings so the model never receives
-            # unexpected types (e.g. None, int, float) from upstream callers.
-            terms = [str(t) if t else "" for t in terms]
+            # unexpected types (e.g. None, NaN, int) from upstream callers.
+            terms = [_to_text(t) for t in terms]
 
             for model_name, model in self.models.items():
 
@@ -133,15 +180,22 @@ class Embedder:
                     convert_to_numpy     = True,
                 )
 
-                # Apply dimensionality reduction only when enabled and when
-                # there are strictly more terms than target dimensions —
-                # UMAP requires at least n_components + 1 input points.
-                if (
-                    self.config.dimensionality_reduction
-                    and self.reducer is not None
-                    and len(embeddings) > self.config.n_components
-                ):
-                    embeddings = self.reducer.fit_transform(embeddings)
+                # self.reducers is empty when dimensionality reduction is
+                # disabled, so this lookup also acts as the on/off switch.
+                reducer = self.reducers.get(model_name)
+                if reducer is not None:
+                    # UMAP's spectral initialisation needs strictly more
+                    # points than n_components + 1, so smaller inputs are
+                    # returned unreduced.
+                    if len(embeddings) > self.config.n_components + 1:
+                        embeddings = reducer.fit_transform(embeddings)
+                    else:
+                        Logger().log(
+                            f"Skipping dimensionality reduction for '{model_name}': "
+                            f"{len(embeddings)} term(s) given, at least "
+                            f"{self.config.n_components + 2} needed. Returning "
+                            f"full-dimensional embeddings."
+                        )
 
                 ret[model_name] = embeddings
 

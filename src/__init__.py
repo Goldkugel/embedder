@@ -1,8 +1,8 @@
 """
 Embedder package.
 
-Exports the Embedder class and its EmbedderConfig Pydantic model for use
-by the adapter framework and any other consumers of this package.
+Exports the Embedder class and its EmbedderConfig Pydantic model, so
+consumers can write `from embedder import Embedder, EmbedderConfig`.
 """
 
 from .Embedder       import Embedder
