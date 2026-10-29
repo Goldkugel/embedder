@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Embedding cache (see cache_folder in config/config.yaml)
+data/cache/

@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "embedder"
-version = "1.2.0"
+description = "Configuration-driven Sentence Transformers embeddings with optional UMAP dimensionality reduction."
+readme = "README.md"
+version = "2.0.0"
 requires-python = ">=3.10"
 dependencies = [
-    "logger @ git+https://github.com/Goldkugel/logger.git@v1.0.6",
-    "numpy",
-    "pydantic>=2",
-    "PyYAML",
-    "sentence-transformers",
-    "umap-learn",
+    "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0",
+    "numpy>=1.24,<3",
+    "pydantic>=2,<3",
+    "PyYAML>=6,<7",
+    "sentence-transformers>=3,<7",
+    "umap-learn>=0.5.4,<0.6",
 ]
 
 [project.optional-dependencies]
@@ -23,3 +25,11 @@ packages = ["embedder"]
 
 [tool.setuptools.package-dir]
 "embedder" = "src"
+
+[tool.pytest.ini_options]
+# The real-model smoke test is marked "slow" and skipped by default, so a
+# plain `pytest` run needs no download; `pytest -m slow` runs only that test.
+markers = [
+    "slow: downloads and runs a real model; deselected by default, run with `pytest -m slow`",
+]
+addopts = "-m 'not slow'"
