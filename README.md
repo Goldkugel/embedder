@@ -8,10 +8,12 @@ A flexible, configuration-driven Python library for encoding textual terms into 
 - **Multi-model inference** — load several Sentence Transformers models and encode the same terms with each of them in a single `embed()` call.
 - **Reproducible models** — pin each Hugging Face model to an exact revision (commit hash), so an update on the Hub cannot change your results.
 - **Configurable pooling** — choose how token vectors are combined into one embedding (`mean`, `cls`, ...), e.g. `cls` to match how SapBERT was trained.
-- **Embedding cache** — optionally keep a JSON file per model mapping each term to its embedding, so only terms not seen before are encoded. Files are written safely: an interrupted save never leaves a broken cache behind.
-- **Progress and checkpoints** — long runs log their progress every `progress_interval` terms and save the embeddings so far to the cache, so an interrupted run resumes where it stopped.
+- **Flexible configuration** — create an `Embedder` from a YAML file, a dict or an `EmbedderConfig` object.
+- **Embedding cache** — optionally keep a JSON file per model mapping each term to its embedding, so only terms not seen before are encoded. Values are rounded (6 decimals by default) to keep the files small, and whitespace variants (and, for uncased models such as SapBERT, case variants) of a term share one entry.
+- **Progress and checkpoints** — long runs log their progress every `progress_interval` terms and append the new embeddings to the cache, so an interrupted run resumes where it stopped. Appending keeps checkpoints fast however large the cache grows, and a file cut off by a killed job is repaired automatically.
 - **Optional dimensionality reduction** — `reduce()` projects embeddings down to 2D/3D with UMAP, for visualization or clustering. `embed()` always returns the full-dimensional vectors, which are the ones to use for similarity and matching.
 - **CPU by default** — runs on `cpu`, with an optional limit on the number of CPU threads for shared machines; `cuda` or `mps` can be configured (the value is passed straight through to Sentence Transformers).
+- **Faster CPU inference** — optionally run the models with OpenVINO and int8 weights, about twice as fast on the CPU for SapBERT.
 - **Optional L2 normalization** — normalize output vectors for cosine-similarity use cases.
 
 ## Repository Structure
@@ -29,7 +31,7 @@ A flexible, configuration-driven Python library for encoding textual terms into 
 │   ├── EmbedderConfig.py    # Pydantic configuration schema
 │   └── Embedder.py          # Core embedding engine
 ├── tests/
-│   └── EmbedderTest.py      # Pytest suite (mocked by default; one slow real-model test)
+│   └── EmbedderTest.py      # Pytest suite (mocked by default; slow real-model tests)
 ├── LICENSE
 └── pyproject.toml
 ```
@@ -50,6 +52,16 @@ Then install the package:
 pip install .
 ```
 
+For the OpenVINO backend (`backend: "openvino"`), install the `openvino` extra. It also needs `torchvision`; install that from the CPU index as well, otherwise pip installs a CUDA build that does not match the CPU-only PyTorch:
+
+```bash
+pip install torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+```bash
+pip install ".[openvino]"
+```
+
 For running the test suite, install the `test` extra:
 
 ```bash
@@ -68,9 +80,13 @@ embedder:
     "cambridgeltl/SapBERT-from-PubMedBERT-fulltext": "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
   pooling: "mean"
   cache_folder: "./data/cache/embeddings/"
+  cache_decimals: 6
   progress_interval: 10000
   num_threads: null
   device: "cpu"
+  backend: "torch"
+  quantize_int8: False
+  lowercase: "auto"
   batch_size: 128
   max_seq_length: 128
   normalization: true
@@ -90,12 +106,30 @@ The logger is a process-wide singleton (see the `logger` package). If it has not
 
 ## Usage
 
+### Creating an Embedder
+
+```python
+from embedder import Embedder, EmbedderConfig
+
+# From a YAML file (default: "./config/config.yaml" relative to the
+# working directory); str or pathlib.Path.
+embedder = Embedder("./config/config.yaml")
+
+# From a dict: either the whole configuration (with "embedder" and
+# optionally "logger" keys) or just the embedder settings.
+embedder = Embedder({"model_id": ["cambridgeltl/SapBERT-from-PubMedBERT-fulltext"]})
+
+# From an EmbedderConfig.
+embedder = Embedder(EmbedderConfig(model_id=["cambridgeltl/SapBERT-from-PubMedBERT-fulltext"]))
+```
+
+If the logger singleton has not been configured yet, it is configured from the same source: the YAML file, or the `logger` key of a full configuration dict. Otherwise (embedder settings only, or an `EmbedderConfig`) configure it first with `Logger("path/to/config.yaml")`, or it falls back to `./config/config.yaml`.
+
 ### Generating embeddings
 
 ```python
 from embedder import Embedder
 
-# Defaults to "./config/config.yaml" relative to the working directory.
 embedder = Embedder("./config/config.yaml")
 
 terms = [
@@ -128,7 +162,7 @@ reduced_map = embedder.reduce(embeddings_map)
 
 ### Validating a configuration in code
 
-`Embedder` itself is always created from a YAML file. `EmbedderConfig` can also be built directly, for example to check settings before writing them to the file:
+`EmbedderConfig` can be built on its own, for example to check settings before writing them to the file or passing them to `Embedder`:
 
 ```python
 from embedder import EmbedderConfig
@@ -155,7 +189,7 @@ By default, only the fast tests run. They mock `SentenceTransformer`, `umap.UMAP
 pytest tests/EmbedderTest.py -v
 ```
 
-Two slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries and check that the pooling setting takes effect:
+Three slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries, check that the pooling setting takes effect, and compare the OpenVINO backend with torch (skipped unless the `openvino` extra is installed):
 
 ```bash
 pytest tests/EmbedderTest.py -v -m slow

@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc       import Iterable
 from sentence_transformers import SentenceTransformer
 from .EmbedderConfig       import EmbedderConfig
-from logger                import Logger
+from logger                import Logger, LoggerConfig
 import hashlib
 import json
 import math
@@ -33,6 +33,9 @@ except ImportError:
 # Key under which embedder settings are expected to live in the YAML config file.
 configuration_section: str = "embedder"
 
+# Key of the logger settings in the same file (see the logger package).
+logger_section: str        = "logger"
+
 # Default path to the config file, used if no path is explicitly passed in.
 standard_directory: str    = "./config/config.yaml"
 
@@ -46,6 +49,17 @@ def _to_text(term) -> str:
     if term is None or (isinstance(term, float) and math.isnan(term)):
         return ""
     return str(term)
+
+
+def _clean_term(term: str, lowercase: bool) -> str:
+    """
+    Collapse runs of whitespace (including leading and trailing) into
+    single spaces and, if `lowercase` is True, lowercase the term. The
+    result is both the text the model encodes and the term's key in the
+    cache, so "Renal  cyst" and "Renal cyst" are encoded and cached once.
+    """
+    term = " ".join(term.split())
+    return term.lower() if lowercase else term
 
 
 class Embedder:
@@ -62,16 +76,24 @@ class Embedder:
     output of a single call, not across calls.
     """
 
-    def __init__(self, config: str = standard_directory):
+    def __init__(
+        self, config: str | os.PathLike | dict | EmbedderConfig = standard_directory
+    ):
         """
         Load and validate configuration, then initialise all configured
         SentenceTransformer models and (if enabled) one UMAP reducer per model.
 
         Parameters
         ----------
-        config : str, optional
-            Path to the YAML configuration file. Defaults to
-            ./config/config.yaml relative to the working directory.
+        config : str, os.PathLike, dict or EmbedderConfig, optional
+            Where the settings come from:
+            - a path to a YAML configuration file with an "embedder"
+              section (default: ./config/config.yaml relative to the
+              working directory);
+            - a dict, either the content of such a file (with "embedder"
+              and optionally "logger" keys) or just the embedder settings
+              themselves;
+            - a ready EmbedderConfig, which is used as is.
 
         Raises
         ------
@@ -81,30 +103,29 @@ class Embedder:
             If the configuration file has no "embedder" section, or a
             loaded model has no pooling module to configure.
         pydantic.ValidationError
-            If the "embedder" section contains unknown keys or invalid values.
+            If the embedder settings contain unknown keys or invalid values.
         """
         # Initialise instance attributes explicitly so each Embedder instance
         # has its own model and reducer registries, rather than sharing
         # class-level mutable defaults.
-        self.models   : dict = {}
-        self.reducers : dict = {}
+        self.models    : dict = {}
+        self.reducers  : dict = {}
+        # Per model ID: whether terms are lowercased before encoding and
+        # cache lookup (see the `lowercase` setting).
+        self.lowercase : dict = {}
 
-        # An empty file parses to None, so fall back to an empty dict to get
-        # the clearer "missing section" error below instead of a TypeError.
-        with open(config, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        if configuration_section not in data:
-            raise ValueError(
-                f"Configuration file '{config}' has no '{configuration_section}' section."
-            )
-        # A section that is present but empty (`embedder:` with nothing
-        # below it) also parses to None; treat it as "use all defaults".
-        self.config = EmbedderConfig.model_validate(data[configuration_section] or {})
+        self.config, logger_path, logger_settings = Embedder._resolve_config(config)
 
         # The logger is a process-wide singleton. If the entry point has not
-        # configured it yet, configure it from the same file as the embedder
-        # instead of falling back to ./config/config.yaml.
-        l = Logger() if Logger.config is not None else Logger(config)
+        # configured it yet, configure it from the same source as the
+        # embedder: the same YAML file, or the "logger" key of the same
+        # dict. Without either, Logger() falls back to ./config/config.yaml.
+        if Logger.config is None and logger_path is not None:
+            l = Logger(logger_path)
+        else:
+            if Logger.config is None and logger_settings is not None:
+                Logger.config = LoggerConfig.model_validate(logger_settings)
+            l = Logger()
 
         # Limit PyTorch's CPU threads before any model runs, so a large job
         # does not occupy every core of a shared machine.
@@ -123,11 +144,16 @@ class Embedder:
                 revision = self.config.revision.get(model_id)
                 l.log(
                     f"Loading embedding model '{model_id}' (revision "
-                    f"'{revision or 'latest'}', pooling '{self.config.pooling}') "
+                    f"'{revision or 'latest'}', pooling '{self.config.pooling}', "
+                    f"backend '{self.config.backend}"
+                    f"{' int8' if self.config.quantize_int8 else ''}') "
                     f"on device '{self.config.device}'..."
                 )
                 model = SentenceTransformer(
-                    model_id, device=self.config.device, revision=revision
+                    model_id,
+                    device   = self.config.device,
+                    revision = revision,
+                    **self._backend_arguments(),
                 )
                 Embedder._apply_pooling(model, self.config.pooling)
 
@@ -135,7 +161,21 @@ class Embedder:
                 # configured value — inputs longer than this are truncated.
                 model.max_seq_length = self.config.max_seq_length
                 self.models[model_id] = model
-                l.log(f"Loading embedding model '{model_id}' completed.")
+
+                if self.config.lowercase == "auto":
+                    # Uncased models (e.g. SapBERT) lowercase every input in
+                    # their tokenizer, so "Seizure" and "seizure" give the
+                    # same vector; lowercasing here as well avoids encoding
+                    # and caching both. The `is True` check also keeps
+                    # tokenizers without this attribute (or test mocks) cased.
+                    tokenizer = getattr(model, "tokenizer", None)
+                    self.lowercase[model_id] = getattr(tokenizer, "do_lower_case", None) is True
+                else:
+                    self.lowercase[model_id] = self.config.lowercase
+                l.log(
+                    f"Loading embedding model '{model_id}' completed (terms are "
+                    f"{'lowercased' if self.lowercase[model_id] else 'kept cased'})."
+                )
 
             if self.config.dimensionality_reduction:
                 # Initialise one UMAP reducer per model with the configured
@@ -161,14 +201,19 @@ class Embedder:
         """
         Encode a sequence of text terms into full-dimensional embeddings.
 
-        Each loaded model produces one set of embeddings. Every distinct
-        term is encoded only once per call. If `cache_folder` is configured,
-        terms already in the model's cache file are loaded from it instead
-        of being encoded, and newly encoded terms are added to it.
+        Each loaded model produces one set of embeddings. Whitespace in each
+        term is collapsed and, for models with lowercasing enabled (see the
+        `lowercase` setting), the term is lowercased; terms that are equal
+        after this are encoded only once per call. If `cache_folder` is
+        configured, terms already in the model's cache file are loaded from
+        it instead of being encoded, and newly encoded terms are appended to
+        it, rounded to `cache_decimals` decimals (the returned vectors are
+        rounded the same way, so they always equal what the cache holds).
 
         Terms are encoded in chunks of `progress_interval`. After each chunk
-        a progress message is logged and, if caching is enabled, the cache
-        file is saved, so an interrupted run resumes where it stopped.
+        a progress message is logged and, if caching is enabled, the chunk
+        is appended to the cache file, so an interrupted run resumes where
+        it stopped.
 
         Parameters
         ----------
@@ -201,17 +246,31 @@ class Embedder:
             terms = [_to_text(t) for t in terms]
 
             for model_name, model in self.models.items():
-                # cache maps each term to its embedding. Without caching it
+                # The text actually encoded, which is also the cache key.
+                keys = [_clean_term(t, self.lowercase[model_name]) for t in terms]
+
+                # cache maps each key to its embedding. Without caching it
                 # starts empty and only lives for this call, which still
                 # avoids encoding a repeated term twice.
                 cache_path = self._cache_path(model_name)
-                cache = Embedder.load_cache(cache_path) if cache_path is not None else {}
+                cache = {}
+                if cache_path is not None:
+                    cache, intact = Embedder._read_cache(cache_path)
+                    if not intact:
+                        # An append was interrupted (e.g. the job was
+                        # killed). Rewrite the file from the entries that
+                        # could be read, so new entries can be appended.
+                        Logger().log(
+                            f"Cache file '{cache_path}' was incomplete; rewriting it "
+                            f"with the {len(cache)} entries that could be read."
+                        )
+                        Embedder.save_cache(cache_path, cache)
 
-                # Distinct terms not in the cache yet, in first-seen order.
-                missing = [t for t in dict.fromkeys(terms) if t not in cache]
+                # Distinct keys not in the cache yet, in first-seen order.
+                missing = [k for k in dict.fromkeys(keys) if k not in cache]
                 if cache_path is not None:
                     Logger().log(
-                        f"'{model_name}': {len(set(terms)) - len(missing)} distinct "
+                        f"'{model_name}': {len(set(keys)) - len(missing)} distinct "
                         f"term(s) loaded from cache, {len(missing)} to encode."
                     )
 
@@ -219,7 +278,7 @@ class Embedder:
 
                 # Assemble the output in the caller's order, including
                 # duplicates, from the (now complete) cache.
-                ret[model_name] = np.stack([cache[t] for t in terms])
+                ret[model_name] = np.stack([cache[k] for k in keys])
 
         return ret
 
@@ -279,10 +338,10 @@ class Embedder:
         return ret
 
     @staticmethod
-    def save_cache(path: str, cache: dict) -> None:
+    def save_cache(path: str, cache: dict, decimals: int | None = None) -> None:
         """
-        Write an embedding cache to a JSON file without ever leaving a
-        half-written file behind.
+        Write a complete embedding cache to a JSON file without ever leaving
+        a half-written file behind.
 
         The data is first written to `<path>.tmp`, flushed to disk, and only
         then renamed to `path`. The rename replaces the old file in a single
@@ -292,7 +351,7 @@ class Embedder:
 
         The file is a JSON object mapping each term to its embedding (a list
         of numbers), written with one term per line so load_cache() can read
-        large files line by line.
+        large files line by line and append_cache() can add entries cheaply.
 
         Parameters
         ----------
@@ -300,6 +359,9 @@ class Embedder:
             Destination JSON file. Its folder is created if missing.
         cache : dict
             Mapping from term (str) to embedding (1-D numpy array).
+        decimals : int or None, optional
+            Round every value to this many decimals before writing (smaller
+            file). None writes the exact float32 values.
         """
         folder = os.path.dirname(path)
         if folder:
@@ -310,11 +372,7 @@ class Embedder:
             f.write("{\n")
             for i, (term, vector) in enumerate(cache.items()):
                 separator = ",\n" if i < len(cache) - 1 else "\n"
-                # astype(str) on float32 gives the shortest text that reads
-                # back to exactly the same float32 value, which keeps the
-                # file much smaller than Python's float64 repr would.
-                numbers = ",".join(np.asarray(vector, dtype=np.float32).astype(str))
-                f.write(f"{json.dumps(term, ensure_ascii=False)}: [{numbers}]{separator}")
+                f.write(Embedder._cache_entry(term, vector, decimals) + separator)
             f.write("}\n")
             # Make sure the data is on disk before the rename makes it visible.
             f.flush()
@@ -322,14 +380,90 @@ class Embedder:
         os.replace(tmp_path, path)
 
     @staticmethod
+    def append_cache(path: str, entries: dict, decimals: int | None = None) -> None:
+        """
+        Add entries to a cache file written by save_cache(), without
+        rewriting the entries already in it.
+
+        The closing brace at the end of the file is replaced by the new
+        entries followed by a new closing brace, so the file stays a valid
+        JSON object and the cost of a checkpoint only depends on the number
+        of new entries. If `path` does not exist yet, it is created with
+        save_cache().
+
+        Unlike save_cache(), an append is not done in a single step: if the
+        process is killed during it, the file can end with an incomplete
+        line and no closing brace. The entries written before are kept;
+        load_cache() skips the incomplete line, and embed() rewrites such a
+        file before appending to it again.
+
+        Terms are not checked for duplicates; appending a term that is
+        already in the file adds a second line for it, and the later one
+        wins when the file is read.
+
+        Parameters
+        ----------
+        path : str
+            Cache file to extend.
+        entries : dict
+            Mapping from term (str) to embedding (1-D numpy array).
+        decimals : int or None, optional
+            Round every value to this many decimals before writing. None
+            writes the exact float32 values.
+
+        Raises
+        ------
+        ValueError
+            If the file does not end with a closing brace (e.g. after an
+            interrupted append), since appending would then corrupt it.
+        """
+        if not entries:
+            return
+        if not os.path.exists(path):
+            Embedder.save_cache(path, entries, decimals)
+            return
+
+        # Build the text first, so a value that cannot be written raises
+        # before the file is touched.
+        text = ",\n".join(
+            Embedder._cache_entry(term, vector, decimals) for term, vector in entries.items()
+        )
+
+        with open(path, "r+b") as f:
+            # The closing brace is the last non-whitespace character; the
+            # end of the file is enough to find it and what precedes it.
+            size = f.seek(0, os.SEEK_END)
+            start = max(0, size - 4096)
+            f.seek(start)
+            tail = f.read().rstrip()
+            if not tail.endswith(b"}"):
+                raise ValueError(
+                    f"Cache file '{path}' does not end with '}}'; it was probably "
+                    f"cut off. Rewrite it with save_cache(path, load_cache(path))."
+                )
+            before = tail[:-1].rstrip()
+
+            # Cut the file right after the last entry (or the opening brace
+            # of an empty object) and write the new entries plus a new
+            # closing brace in its place.
+            f.seek(start + len(before))
+            f.truncate()
+            separator = "\n" if before.endswith(b"{") else ",\n"
+            f.write(f"{separator}{text}\n}}\n".encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+
+    @staticmethod
     def load_cache(path: str) -> dict:
         """
-        Read an embedding cache written by save_cache().
+        Read an embedding cache written by save_cache() / append_cache().
 
-        Returns an empty dict if the file does not exist. Files in
-        save_cache()'s one-term-per-line layout are parsed line by line, so
-        a large cache never has to exist as one big Python object; any other
-        valid JSON object of the same shape is read with json.load().
+        Returns an empty dict if the file does not exist. Files in the
+        one-term-per-line layout are parsed line by line, so a large cache
+        never has to exist as one big Python object; any other valid JSON
+        object of the same shape is read with json.load(). If an append was
+        interrupted, the incomplete last line is skipped and all complete
+        entries are returned.
 
         Parameters
         ----------
@@ -340,24 +474,72 @@ class Embedder:
         -------
         dict
             Mapping from term (str) to embedding (1-D float32 numpy array).
+
+        Raises
+        ------
+        ValueError
+            If the file is neither valid JSON nor in the one-term-per-line
+            layout.
+        """
+        return Embedder._read_cache(path)[0]
+
+    @staticmethod
+    def _read_cache(path: str) -> tuple[dict, bool]:
+        """
+        Read a cache file like load_cache(), and also report whether it was
+        complete (True), or cut off by an interrupted append (False).
         """
         if not os.path.exists(path):
-            return {}
+            return {}, True
 
-        cache = {}
         with open(path, "r", encoding="utf-8") as f:
-            if f.readline().strip() == "{":
+            line_layout = f.readline().strip() == "{"
+
+        if line_layout:
+            cache, closed, broken_lines = {}, False, 0
+            with open(path, "r", encoding="utf-8") as f:
+                f.readline()
                 for line in f:
                     line = line.strip().rstrip(",")
-                    if line in ("", "}"):
+                    if line == "":
                         continue
-                    (term, vector), = json.loads("{" + line + "}").items()
-                    cache[term] = np.asarray(vector, dtype=np.float32)
-                return cache
+                    if line == "}":
+                        closed = True
+                        continue
+                    try:
+                        (term, vector), = json.loads("{" + line + "}").items()
+                        cache[term] = np.asarray(vector, dtype=np.float32)
+                    except ValueError:
+                        broken_lines += 1
+            if closed and broken_lines == 0:
+                return cache, True
 
-        # Not in save_cache()'s layout (e.g. edited by hand): read it whole.
-        with open(path, "r", encoding="utf-8") as f:
-            return {t: np.asarray(v, dtype=np.float32) for t, v in json.load(f).items()}
+        # Not in the line layout (e.g. edited by hand, or pretty-printed):
+        # read it whole.
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return {t: np.asarray(v, dtype=np.float32) for t, v in json.load(f).items()}, True
+        except ValueError:
+            if not line_layout:
+                raise ValueError(f"Cache file '{path}' could not be read.")
+
+        # The line layout without a closing brace (or with a broken last
+        # line): an interrupted append. Keep every complete entry.
+        return cache, False
+
+    @staticmethod
+    def _cache_entry(term: str, vector, decimals: int | None) -> str:
+        """
+        Format one cache entry as `"term": [v1,v2,...]` (without a trailing
+        comma or newline).
+        """
+        vector = np.asarray(vector, dtype=np.float32)
+        if decimals is not None:
+            vector = np.round(vector, decimals)
+        # astype(str) on float32 gives the shortest text that reads back to
+        # exactly the same float32 value, which keeps the file much smaller
+        # than Python's float64 repr would.
+        return f"{json.dumps(term, ensure_ascii=False)}: [{','.join(vector.astype(str))}]"
 
     def _encode_into_cache(
         self, model_name: str, model, terms: list[str], cache: dict, cache_path: str | None
@@ -365,8 +547,12 @@ class Embedder:
         """
         Encode `terms` with `model` in chunks of `progress_interval` and add
         each embedding to `cache`. After every chunk, log the progress and
-        (if caching is enabled) save the cache, so the work done so far
-        survives an interrupted run.
+        (if caching is enabled) append the chunk to the cache file, so the
+        work done so far survives an interrupted run.
+
+        With caching enabled, the vectors are rounded to `cache_decimals`
+        before being added, so `cache` holds exactly what a later run reads
+        back from the file.
         """
         total = len(terms)
         interval = self.config.progress_interval
@@ -383,14 +569,18 @@ class Embedder:
                 normalize_embeddings = self.config.normalization,
                 convert_to_numpy     = True,
             )
-            cache.update(zip(chunk, vectors))
+            vectors = np.asarray(vectors, dtype=np.float32)
+            if cache_path is not None and self.config.cache_decimals is not None:
+                vectors = np.round(vectors, self.config.cache_decimals)
+            entries = dict(zip(chunk, vectors))
+            cache.update(entries)
 
             done = start + len(chunk)
             Logger().log(
                 f"'{model_name}': encoded {done}/{total} term(s) ({100 * done / total:.1f}%)."
             )
             if cache_path is not None:
-                Embedder.save_cache(cache_path, cache)
+                Embedder.append_cache(cache_path, entries)
 
     def _cache_path(self, model_name: str) -> str | None:
         """
@@ -399,9 +589,16 @@ class Embedder:
 
         The file name is the model ID (made safe for file systems) plus a
         SHA-256 hash over every setting that changes the output vectors:
-        model ID, revision, pooling, max_seq_length and normalization.
-        Changing any of these starts a new file instead of mixing vectors
-        computed in different ways.
+        model ID, revision, pooling, max_seq_length, normalization and int8
+        quantisation. Changing any of these starts a new file instead of
+        mixing vectors computed in different ways.
+
+        The backend itself is not part of the hash: torch and OpenVINO
+        (without int8) produce the same vectors up to about 1e-6, below the
+        cache's rounding, so they can share a file. Lowercasing and
+        cache_decimals are not part of it either, since lowercasing only
+        changes which keys are looked up and rounding is far below the
+        differences that matter.
         """
         if self.config.cache_folder is None:
             return None
@@ -413,12 +610,69 @@ class Embedder:
                 "pooling"       : self.config.pooling,
                 "max_seq_length": self.config.max_seq_length,
                 "normalization" : self.config.normalization,
+                # Only added when enabled, so files written before this
+                # setting existed keep their names.
+                **({"int8": True} if self.config.quantize_int8 else {}),
             },
             sort_keys=True,
         )
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name)
         return os.path.join(self.config.cache_folder, f"{safe_name}-{digest}.json")
+
+    def _backend_arguments(self) -> dict:
+        """
+        Build the extra SentenceTransformer() arguments for the configured
+        backend. The default torch backend needs none, which also keeps
+        sentence-transformers versions without a `backend` argument working.
+        """
+        if self.config.backend == "torch":
+            return {}
+
+        model_kwargs = {}
+        if self.config.num_threads is not None:
+            # torch.set_num_threads() does not reach OpenVINO, which has its
+            # own thread setting.
+            model_kwargs["ov_config"] = {"INFERENCE_NUM_THREADS": str(self.config.num_threads)}
+        if self.config.quantize_int8:
+            # Compress the weights to 8-bit integers while converting the
+            # model to OpenVINO (about twice as fast on the CPU).
+            model_kwargs["load_in_8bit"] = True
+        return {"backend": self.config.backend, "model_kwargs": model_kwargs}
+
+    @staticmethod
+    def _resolve_config(config) -> tuple[EmbedderConfig, str | None, dict | None]:
+        """
+        Turn the `config` argument of __init__ into an EmbedderConfig.
+
+        Returns the EmbedderConfig, the YAML file it came from (or None),
+        and the "logger" section of a full configuration dict (or None),
+        so __init__ can configure the logger from the same source.
+        """
+        if isinstance(config, EmbedderConfig):
+            return config, None, None
+
+        if isinstance(config, dict):
+            # A full configuration (the parsed YAML file) has an "embedder"
+            # key, which is not a valid embedder setting itself, so the two
+            # kinds of dict cannot be confused.
+            if configuration_section in config:
+                section = config[configuration_section] or {}
+                return EmbedderConfig.model_validate(section), None, config.get(logger_section)
+            return EmbedderConfig.model_validate(config), None, None
+
+        path = os.fspath(config)
+        # An empty file parses to None, so fall back to an empty dict to get
+        # the clearer "missing section" error below instead of a TypeError.
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if configuration_section not in data:
+            raise ValueError(
+                f"Configuration file '{path}' has no '{configuration_section}' section."
+            )
+        # A section that is present but empty (`embedder:` with nothing
+        # below it) also parses to None; treat it as "use all defaults".
+        return EmbedderConfig.model_validate(data[configuration_section] or {}), path, None
 
     @staticmethod
     def _apply_pooling(model, pooling: str) -> None:

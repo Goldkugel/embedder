@@ -58,6 +58,32 @@ class EmbedderConfig(BaseModel):
     # "mps"  — Apple Silicon GPU via Metal Performance Shaders
     device: str                    = "cpu"
 
+    # Inference engine used to run the models:
+    # "torch"    — PyTorch (default).
+    # "openvino" — Intel OpenVINO, which converts each model when it is
+    #              loaded (a few seconds). Needs the "openvino" extra
+    #              (pip install ".[openvino]"). Without quantize_int8 it gives
+    #              the same vectors as torch and is not noticeably faster;
+    #              its benefit is quantize_int8.
+    # ONNX is not offered: its sentence-transformers extra currently cannot
+    # be installed together with sentence-transformers 6.
+    backend: Literal["torch", "openvino"] = "torch"
+
+    # Store the model weights as 8-bit integers (OpenVINO only). Measured
+    # with SapBERT on the CPU: about twice as fast as torch, with a cosine
+    # similarity of at least 0.998 to the full-precision vectors. Changes
+    # the vectors slightly, so it gets its own cache file.
+    quantize_int8: bool            = False
+
+    # Whether terms are lowercased before encoding and cache lookup:
+    # "auto" — lowercase for models whose tokenizer lowercases anyway
+    #          (uncased models such as SapBERT), where it changes nothing
+    #          but avoids encoding and caching "Seizure" and "seizure"
+    #          separately; keep the case for all other models.
+    # True / False — always / never lowercase, for every model.
+    # Runs of whitespace are always collapsed to single spaces.
+    lowercase: bool | Literal["auto"] = "auto"
+
     # Folder for the embedding cache: one JSON file per model and settings,
     # mapping each term to its embedding. embed() only encodes terms that
     # are not in the file yet, which saves a lot of time on the CPU. None
@@ -65,16 +91,23 @@ class EmbedderConfig(BaseModel):
     # updated model would still be served old vectors.
     cache_folder: str | None       = None
 
+    # Number of decimals the cached values are rounded to (with caching
+    # enabled, embed() returns the rounded values too, so they always match
+    # the cache). 6 decimals change a cosine similarity by less than 1e-6
+    # and make the file about a quarter smaller than exact values; None
+    # stores the exact float32 values.
+    cache_decimals: int | None     = Field(default=6, ge=1)
+
     # Number of terms embed() encodes between two progress messages. After
-    # each message the embeddings so far are saved to the cache file (if
-    # cache_folder is set), so an interrupted run resumes from there. Each
-    # save rewrites the whole file, so very small values slow large runs.
+    # each message the newly encoded terms are appended to the cache file
+    # (if cache_folder is set), so an interrupted run resumes from there.
     progress_interval: int         = Field(default=10000, gt=0)
 
-    # Maximum number of CPU threads PyTorch may use. None keeps PyTorch's
-    # default (all cores); set a limit on shared machines. This is a
-    # process-wide setting, so it also affects other PyTorch code running
-    # in the same process.
+    # Maximum number of CPU threads the model may use. None keeps the
+    # default (all cores); set a limit on shared machines. For PyTorch this
+    # is a process-wide setting, so it also affects other PyTorch code
+    # running in the same process; with the OpenVINO backend it is passed
+    # to OpenVINO as well.
     num_threads: int | None        = Field(default=None, gt=0)
 
     # Number of terms processed in a single inference batch. Larger batches
@@ -142,4 +175,14 @@ class EmbedderConfig(BaseModel):
         unknown = sorted(set(self.revision) - set(self.model_id))
         if unknown:
             raise ValueError(f"revision given for model(s) not in model_id: {unknown}")
+        return self
+
+    @model_validator(mode="after")
+    def _check_quantization_backend(self) -> "EmbedderConfig":
+        """
+        Reject quantize_int8 without the OpenVINO backend, instead of
+        silently running the full-precision torch model.
+        """
+        if self.quantize_int8 and self.backend != "openvino":
+            raise ValueError("quantize_int8 requires backend 'openvino'")
         return self

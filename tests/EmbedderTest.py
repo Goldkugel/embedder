@@ -4,33 +4,40 @@ Test suite for the Embedder class and EmbedderConfig model.
 Tests cover:
 - EmbedderConfig: blank model IDs dropped, random_state=None accepted,
   pooling default and allowed values, out-of-range values rejected,
-  revisions for unknown models rejected.
-- __init__: model loading, device, revision and pooling assignment,
-  max_seq_length, CPU thread limit, empty model list, missing config
+  revisions for unknown models rejected, backend and int8 quantisation
+  options, lowercase options.
+- __init__: configuration from a YAML path, a pathlib.Path, a dict (full
+  configuration or embedder section) or an EmbedderConfig; model loading,
+  device, revision, backend and pooling assignment, max_seq_length, CPU
+  thread limit, lowercasing decision, empty model list, missing config
   section, logger configuration, one reducer per model when dimensionality
   reduction is enabled, none when disabled.
 - _apply_pooling(): pooling module replaced, other modules kept.
 - embed(): encode parameters, per-model full-dimensional output, empty
-  model list, empty terms, term coercion, numpy array and single-string
-  input, duplicate terms encoded once, JSON cache (reuse, only missing
-  terms encoded), chunked encoding with progress messages and checkpoints.
-- save_cache() / load_cache(): exact round trip, valid JSON, no file left
-  half-written when a save is interrupted.
+  model list, empty terms, term coercion, whitespace collapsing and
+  lowercasing, numpy array and single-string input, duplicate terms encoded
+  once, JSON cache (reuse, only missing terms encoded, rounding, repair of
+  an interrupted append), chunked encoding with progress messages and
+  checkpoints.
+- save_cache() / append_cache() / load_cache(): exact round trip, rounding,
+  valid JSON after appends, no file left half-written when a save is
+  interrupted, complete entries recovered after an interrupted append.
 - reduce(): each model's own reducer applied, reduction skipped below
   n_components + 2 rows, error when dimensionality reduction is disabled.
-- A slow smoke test with a real model and real UMAP (see TestRealModel).
+- Slow smoke tests with a real model and real UMAP (see TestRealModel).
 
 Apart from the smoke test, SentenceTransformer, UMAP and Logger are mocked,
 so no models are downloaded and no log files are written.
 
 Run with:
     pytest tests/EmbedderTest.py -v           # fast tests only (default)
-    pytest tests/EmbedderTest.py -v -m slow   # real-model smoke test only
+    pytest tests/EmbedderTest.py -v -m slow   # real-model smoke tests only
 """
 
 from __future__ import annotations
 
 import json
+import pathlib
 import sys
 
 import numpy  as np
@@ -156,6 +163,26 @@ class TestEmbedderConfig:
         with pytest.raises(ValidationError, match="not in model_id"):
             EmbedderConfig(model_id=["model-a"], revision={"model-b": "abc123"})
 
+    def test_backend_defaults_to_torch_without_quantization(self):
+        config = EmbedderConfig()
+
+        assert config.backend == "torch"
+        assert config.quantize_int8 is False
+
+    def test_int8_quantization_requires_the_openvino_backend(self):
+        with pytest.raises(ValidationError, match="openvino"):
+            EmbedderConfig(quantize_int8=True)
+
+        assert EmbedderConfig(backend="openvino", quantize_int8=True).quantize_int8
+
+    def test_unknown_backend_is_rejected(self):
+        with pytest.raises(ValidationError):
+            EmbedderConfig(backend="onnx")
+
+    @pytest.mark.parametrize("value", ["auto", True, False])
+    def test_lowercase_accepts_auto_and_booleans(self, value):
+        assert EmbedderConfig(lowercase=value).lowercase == value
+
     @pytest.mark.parametrize(
         "field, value",
         [
@@ -166,6 +193,7 @@ class TestEmbedderConfig:
             ("min_dist",      -0.1),
             ("progress_interval", 0),
             ("num_threads",    0),
+            ("cache_decimals", 0),
         ],
     )
     def test_out_of_range_values_are_rejected(self, field, value):
@@ -275,6 +303,98 @@ class TestEmbedderInit:
 
         assert embedder.models == {}
         mock_st.assert_not_called()
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_accepts_an_embedder_config(self, mock_st):
+        config = EmbedderConfig(model_id=["model-a"], batch_size=7)
+
+        embedder = Embedder(config=config)
+
+        assert embedder.config is config
+        mock_st.assert_called_once_with("model-a", device="cpu", revision=None)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_accepts_a_dict_of_embedder_settings(self, mock_st):
+        embedder = Embedder(config={"model_id": ["model-a"], "batch_size": 7})
+
+        assert embedder.config.batch_size == 7
+        assert set(embedder.models) == {"model-a"}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_accepts_a_full_configuration_dict(self, mock_st, mock_logger):
+        mock_logger.config = None
+        logger_settings = {
+            "folder"       : "./logs/",
+            "file_name"    : "out.log",
+            "header_char"  : "-",
+            "header_length": 60,
+            "log_runtime"  : True,
+            "format"       : "%Y-%m-%d %H:%M:%S",
+            "encoding"     : "utf-8",
+        }
+
+        embedder = Embedder(
+            config={"logger": logger_settings, "embedder": {"model_id": ["model-a"]}}
+        )
+
+        assert set(embedder.models) == {"model-a"}
+        # The unconfigured logger is configured from the dict's logger section.
+        assert mock_logger.config.file_name == "out.log"
+        mock_logger.assert_called_once_with()
+
+    def test_init_rejects_unknown_keys_in_a_dict(self):
+        with pytest.raises(ValidationError):
+            Embedder(config={"model_id": [], "batch_sise": 7})
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_accepts_a_pathlib_path(self, mock_st, mock_logger, tmp_path):
+        mock_logger.config = None
+        config_path = pathlib.Path(_write_config(tmp_path, model_id=["model-a"]))
+
+        embedder = Embedder(config=config_path)
+
+        assert set(embedder.models) == {"model-a"}
+        mock_logger.assert_called_once_with(str(config_path))
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_passes_openvino_backend_threads_and_int8(self, mock_st, tmp_path):
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], backend="openvino",
+            quantize_int8=True, num_threads=4,
+        )
+
+        Embedder(config=config_path)
+
+        mock_st.assert_called_once_with(
+            "model-a",
+            device       = "cpu",
+            revision     = None,
+            backend      = "openvino",
+            model_kwargs = {"ov_config": {"INFERENCE_NUM_THREADS": "4"}, "load_in_8bit": True},
+        )
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_lowercases_automatically_for_uncased_tokenizers(self, mock_st, tmp_path):
+        uncased, cased = MagicMock(), MagicMock()
+        uncased.tokenizer.do_lower_case = True
+        cased.tokenizer.do_lower_case   = False
+        mock_st.side_effect = [uncased, cased]
+        config_path = _write_config(tmp_path, model_id=["uncased", "cased"])
+
+        embedder = Embedder(config=config_path)
+
+        assert embedder.lowercase == {"uncased": True, "cased": False}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_lowercase_setting_overrides_the_tokenizer(self, mock_st, tmp_path):
+        model = MagicMock()
+        model.tokenizer.do_lower_case = True
+        mock_st.return_value = model
+        config_path = _write_config(tmp_path, model_id=["model-a"], lowercase=False)
+
+        embedder = Embedder(config=config_path)
+
+        assert embedder.lowercase == {"model-a": False}
 
     def test_init_raises_when_embedder_section_is_missing(self, tmp_path):
         path = tmp_path / "config.yaml"
@@ -415,6 +535,31 @@ class TestEmbed:
         np.testing.assert_array_equal(result["model-a"][:, 0], [2.0, 1.0, 2.0])
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_collapses_whitespace_and_lowercases_when_enabled(
+        self, mock_st, tmp_path
+    ):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        config_path = _write_config(tmp_path, model_id=["model-a"], lowercase=True)
+        embedder = Embedder(config=config_path)
+
+        result = embedder.embed(["Renal  cyst", " renal cyst ", "Renal\tCyst"])
+
+        assert fake_model.encode.call_args.args[0] == ["renal cyst"]
+        assert result["model-a"].shape == (3, 4)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_case_when_lowercasing_is_disabled(self, mock_st, tmp_path):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        config_path = _write_config(tmp_path, model_id=["model-a"], lowercase=False)
+        embedder = Embedder(config=config_path)
+
+        embedder.embed(["Seizure", "seizure"])
+
+        assert fake_model.encode.call_args.args[0] == ["Seizure", "seizure"]
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_accepts_a_numpy_array(self, mock_st, tmp_path):
         fake_model = MagicMock()
         fake_model.encode.return_value = np.zeros((2, 4))
@@ -551,10 +696,10 @@ class TestEmbed:
         assert fake_model.encode.call_count == 2
         assert list(tmp_path.glob("**/*.json")) == []
 
-    @patch.object(Embedder, "save_cache")
+    @patch.object(Embedder, "append_cache")
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
-    def test_embed_logs_and_saves_a_checkpoint_after_every_chunk(
-        self, mock_st, mock_save, mock_logger, tmp_path
+    def test_embed_logs_and_appends_a_checkpoint_after_every_chunk(
+        self, mock_st, mock_append, mock_logger, tmp_path
     ):
         fake_model = _fake_model()
         mock_st.return_value = fake_model
@@ -562,22 +707,73 @@ class TestEmbed:
             tmp_path, model_id=["model-a"], cache_folder=str(tmp_path / "cache"),
             progress_interval=2,
         )
-        # Record the cache size at each save; the mock itself only keeps a
-        # reference to the same (growing) dict.
-        saved_sizes = []
-        mock_save.side_effect = lambda path, cache: saved_sizes.append(len(cache))
         embedder = Embedder(config=config_path)
 
         result = embedder.embed(["a", "b", "c", "d", "e"])
 
         chunks = [c.args[0] for c in fake_model.encode.call_args_list]
         assert chunks == [["a", "b"], ["c", "d"], ["e"]]
-        # The checkpoints hold 2, 4 and finally all 5 terms.
-        assert saved_sizes == [2, 4, 5]
+        # Each checkpoint appends only the terms of its own chunk.
+        appended = [list(c.args[1]) for c in mock_append.call_args_list]
+        assert appended == [["a", "b"], ["c", "d"], ["e"]]
         logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
         assert any("encoded 2/5" in m for m in logged)
         assert any("encoded 5/5" in m for m in logged)
         assert result["model-a"].shape == (5, 4)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_rounds_cached_values_and_returns_them_rounded(self, mock_st, tmp_path):
+        fake_model = MagicMock()
+        fake_model.encode.side_effect = lambda terms, **kwargs: np.full(
+            (len(terms), 4), 1 / 3, dtype=np.float32
+        )
+        mock_st.return_value = fake_model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(tmp_path / "cache"),
+            cache_decimals=2,
+        )
+
+        first  = Embedder(config=config_path).embed(["a"])["model-a"]
+        second = Embedder(config=config_path).embed(["a"])["model-a"]
+
+        np.testing.assert_array_equal(first, np.float32(0.33))
+        np.testing.assert_array_equal(first, second)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_does_not_round_without_a_cache(self, mock_st, tmp_path):
+        fake_model = MagicMock()
+        fake_model.encode.return_value = np.full((1, 4), 1 / 3, dtype=np.float32)
+        mock_st.return_value = fake_model
+        config_path = _write_config(tmp_path, model_id=["model-a"], cache_decimals=2)
+
+        result = Embedder(config=config_path).embed(["a"])["model-a"]
+
+        np.testing.assert_array_equal(result, np.float32(1 / 3))
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_repairs_a_cache_file_cut_off_by_an_interrupted_append(
+        self, mock_st, tmp_path
+    ):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(cache_folder)
+        )
+        Embedder(config=config_path).embed(["a", "bb"])
+        cache_file, = cache_folder.glob("*.json")
+        # Simulate a job killed during an append: closing brace gone and
+        # the last line only half written.
+        text = cache_file.read_text().rstrip().rstrip("}")
+        cache_file.write_text(text + ',\n"ccc": [3.0,3.')
+
+        result = Embedder(config=config_path).embed(["a", "ccc"])
+
+        # "a" survived, the half-written "ccc" is encoded again, and the
+        # file is valid JSON again.
+        assert fake_model.encode.call_args.args[0] == ["ccc"]
+        np.testing.assert_array_equal(result["model-a"][:, 0], [1.0, 3.0])
+        assert set(json.loads(cache_file.read_text())) == {"a", "bb", "ccc"}
 
 class TestReduce:
     """
@@ -695,6 +891,58 @@ class TestCacheFile:
 
         assert [p.name for p in tmp_path.iterdir()] == ["cache.json"]
 
+    def test_save_rounds_to_the_given_decimals(self, tmp_path):
+        path = str(tmp_path / "cache.json")
+
+        Embedder.save_cache(path, {"a": np.array([1 / 3, -2 / 3], dtype=np.float32)}, decimals=3)
+
+        assert json.loads(open(path, encoding="utf-8").read()) == {"a": [0.333, -0.667]}
+
+    def test_append_adds_entries_and_keeps_valid_json(self, tmp_path):
+        path = str(tmp_path / "cache.json")
+        Embedder.save_cache(path, {"a": np.ones(3, dtype=np.float32)})
+
+        Embedder.append_cache(path, {"b": np.zeros(3, dtype=np.float32)})
+        Embedder.append_cache(path, {"c": np.full(3, 2, dtype=np.float32),
+                                     'd "quoted"': np.ones(3, dtype=np.float32)})
+
+        assert set(json.loads(open(path, encoding="utf-8").read())) == {"a", "b", "c", 'd "quoted"'}
+        loaded = Embedder.load_cache(path)
+        np.testing.assert_array_equal(loaded["c"], [2.0, 2.0, 2.0])
+
+    def test_append_to_an_empty_cache_and_to_a_missing_file(self, tmp_path):
+        empty   = str(tmp_path / "empty.json")
+        missing = str(tmp_path / "sub" / "missing.json")
+        Embedder.save_cache(empty, {})
+
+        Embedder.append_cache(empty,   {"a": np.ones(2, dtype=np.float32)})
+        Embedder.append_cache(missing, {"a": np.ones(2, dtype=np.float32)})
+
+        for path in (empty, missing):
+            assert set(json.loads(open(path, encoding="utf-8").read())) == {"a"}
+
+    def test_append_refuses_a_file_without_closing_brace(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text('{\n"a": [1.0]')
+
+        with pytest.raises(ValueError, match="closing|cut off"):
+            Embedder.append_cache(str(path), {"b": np.ones(1, dtype=np.float32)})
+
+    def test_load_recovers_complete_entries_after_an_interrupted_append(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text('{\n"a": [1.0,2.0],\n"b": [3.0,4.0],\n"c": [5.')
+
+        loaded = Embedder.load_cache(str(path))
+
+        assert set(loaded) == {"a", "b"}
+
+    def test_load_rejects_an_unreadable_file(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text("not json")
+
+        with pytest.raises(ValueError, match="could not be read"):
+            Embedder.load_cache(str(path))
+
     def test_load_of_a_missing_file_returns_an_empty_cache(self, tmp_path):
         assert Embedder.load_cache(str(tmp_path / "missing.json")) == {}
 
@@ -797,6 +1045,28 @@ class TestRealModel:
 
         assert vectors["mean"].shape == vectors["cls"].shape == (1, 384)
         assert not np.allclose(vectors["mean"], vectors["cls"])
+
+    def test_openvino_backend_matches_torch(self, tmp_path):
+        # Needs the "openvino" extra; skipped where it is not installed.
+        pytest.importorskip("optimum.intel")
+        terms = ["Microcephaly", "Seizure", "Renal dysplasia"]
+        vectors = {}
+        for backend, int8 in (("torch", False), ("openvino", False), ("openvino", True)):
+            config_path = _write_config(
+                tmp_path,
+                model_id      = [self.MODEL_ID],
+                revision      = {self.MODEL_ID: self.REVISION},
+                backend       = backend,
+                quantize_int8 = int8,
+            )
+            vectors[backend, int8] = Embedder(config=config_path).embed(terms)[self.MODEL_ID]
+
+        reference = vectors["torch", False]
+        # Full precision: the same vectors up to float noise.
+        np.testing.assert_allclose(vectors["openvino", False], reference, atol=1e-5)
+        # int8 weights: close, but not identical.
+        cosine = (vectors["openvino", True] * reference).sum(axis=1)
+        assert cosine.min() > 0.99
 
 
 if __name__ == "__main__":

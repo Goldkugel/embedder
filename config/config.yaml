@@ -13,9 +13,13 @@ embedder:
     "cambridgeltl/SapBERT-from-PubMedBERT-fulltext": "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
   pooling: "mean"
   cache_folder: "./data/cache/embeddings/"
+  cache_decimals: 6
   progress_interval: 10000
   num_threads: null
   device: "cpu"
+  backend: "torch"
+  quantize_int8: False
+  lowercase: "auto"
   batch_size: 128
   max_seq_length: 128
   normalization: True
