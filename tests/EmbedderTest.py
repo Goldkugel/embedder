@@ -5,39 +5,53 @@ Tests cover:
 - EmbedderConfig: blank model IDs dropped, random_state=None accepted,
   pooling default and allowed values, out-of-range values rejected,
   revisions for unknown models rejected, backend and int8 quantisation
-  options, lowercase options.
-- __init__: configuration from a YAML path, a pathlib.Path, a dict (full
-  configuration or embedder section) or an EmbedderConfig; model loading,
-  device, revision, backend and pooling assignment, max_seq_length, CPU
-  thread limit, lowercasing decision, empty model list, missing config
-  section, logger configuration, one reducer per model when dimensionality
-  reduction is enabled, none when disabled.
-- _apply_pooling(): pooling module replaced, other modules kept.
+  options, lowercase options, duplicate model IDs rejected, revision keys
+  stripped, UMAP metric names checked, the shipped config/config.yaml is
+  valid.
+- __init__: configuration from a YAML path (including the default path),
+  a pathlib.Path, a dict (full configuration or embedder section) or an
+  EmbedderConfig; missing, empty and invalid configuration, missing logger
+  section; pooling warning, max_seq_length checked against the model;
+  model loading, device, revision, backend and pooling assignment,
+  max_seq_length, CPU
+  thread limit, lowercasing decision, empty model list, logger
+  configuration, one reducer per model when dimensionality reduction is
+  enabled, none when disabled, no registries shared between instances.
+- _apply_pooling(): pooling module replaced, other modules kept, previous
+  mode returned.
 - embed(): encode parameters, per-model full-dimensional output, empty
-  model list, empty terms, term coercion, whitespace collapsing and
-  lowercasing, numpy array and single-string input, duplicate terms encoded
-  once, JSON cache (reuse, only missing terms encoded, rounding, repair of
-  an interrupted append), chunked encoding with progress messages and
+  model list, empty or None terms, term coercion (including pandas missing
+  values), whitespace collapsing and lowercasing, numpy array, tuple,
+  generator, array and single-string input, duplicate terms encoded once,
+  NaN and infinite vectors returned and logged but not cached, JSON
+  cache (reuse, only missing terms encoded, rounding, repair of an
+  interrupted append, which settings start a new cache file, file names,
+  one file per model), chunked encoding with progress messages and
   checkpoints.
 - save_cache() / append_cache() / load_cache(): exact round trip, rounding,
-  valid JSON after appends, no file left half-written when a save is
-  interrupted, complete entries recovered after an interrupted append.
+  valid JSON after appends (also to a pretty-printed file), duplicates,
+  NaN and infinity refused, malformed files and entries rejected,
+  no file left half-written when a save is interrupted, complete entries
+  recovered after an interrupted append or a broken line.
 - reduce(): each model's own reducer applied, reduction skipped below
-  n_components + 2 rows, error when dimensionality reduction is disabled.
+  n_components + 2 rows, error when dimensionality reduction is disabled
+  or a model was not loaded.
+- Package exports.
 - Slow smoke tests with a real model and real UMAP (see TestRealModel).
 
 Apart from the smoke test, SentenceTransformer, UMAP and Logger are mocked,
 so no models are downloaded and no log files are written.
 
-Run with:
-    pytest tests/EmbedderTest.py -v           # fast tests only (default)
-    pytest tests/EmbedderTest.py -v -m slow   # real-model smoke tests only
+Run from the repository root with:
+    pytest -v           # fast tests only (default)
+    pytest -v -m slow   # real-model smoke tests only
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 
 import numpy  as np
@@ -46,7 +60,12 @@ import yaml
 from pydantic      import ValidationError
 from unittest.mock import MagicMock, patch
 
+import embedder
 from embedder import Embedder, EmbedderConfig
+from logger   import LoggerConfig
+
+# The configuration file shipped with the repository.
+_SHIPPED_CONFIG = pathlib.Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 
 # Resolve the actual module object Embedder lives in via sys.modules,
 # rather than building a dotted string like "embedder.Embedder" for @patch
@@ -99,7 +118,19 @@ def _fake_model():
     return model
 
 
-def _write_config(tmp_path, **overrides):
+# Settings for the "logger" section of test configurations.
+_LOGGER_SETTINGS = {
+    "folder"       : "./logs/",
+    "file_name"    : "out.log",
+    "header_char"  : "-",
+    "header_length": 60,
+    "log_runtime"  : True,
+    "format"       : "%Y-%m-%d %H:%M:%S",
+    "encoding"     : "utf-8",
+}
+
+
+def _write_config(tmp_path, logger=None, **overrides):
     """
     Write an "embedder" section config YAML to a temp file, with
     sensible defaults for the commonly overridden fields, overridden or
@@ -111,6 +142,8 @@ def _write_config(tmp_path, **overrides):
     ----------
     tmp_path : pathlib.Path
         Pytest-provided temporary directory to write the config into.
+    logger : dict or None, optional
+        Content of a "logger" section; None writes no such section.
     **overrides
         Any EmbedderConfig field to override from the defaults.
 
@@ -133,9 +166,12 @@ def _write_config(tmp_path, **overrides):
         "random_state"            : 42,
     }
     cfg.update(overrides)
+    data = {"embedder": cfg}
+    if logger is not None:
+        data["logger"] = logger
     path = tmp_path / "config.yaml"
     with open(path, "w") as f:
-        yaml.safe_dump({"embedder": cfg}, f)
+        yaml.safe_dump(data, f)
     return str(path)
 
 
@@ -199,6 +235,39 @@ class TestEmbedderConfig:
     def test_out_of_range_values_are_rejected(self, field, value):
         with pytest.raises(ValidationError):
             EmbedderConfig(**{field: value})
+
+    def test_model_ids_are_stripped(self):
+        assert EmbedderConfig(model_id=["  model-a "]).model_id == ["model-a"]
+
+    def test_duplicate_model_ids_are_rejected(self):
+        with pytest.raises(ValidationError, match="more than once"):
+            EmbedderConfig(model_id=["model-a", " model-a "])
+
+    def test_revision_keys_and_values_are_stripped(self):
+        config = EmbedderConfig(model_id=[" model-a "], revision={" model-a ": " abc123 "})
+
+        assert config.revision == {"model-a": "abc123"}
+
+    @pytest.mark.parametrize("metric", ["cosine", "euclidean", "manhattan", "correlation"])
+    def test_known_umap_metrics_are_accepted(self, metric):
+        assert EmbedderConfig(metric=metric).metric == metric
+
+    def test_unknown_umap_metric_is_rejected(self):
+        with pytest.raises(ValidationError, match="unknown UMAP metric 'cosin'"):
+            EmbedderConfig(metric="cosin")
+
+    def test_shipped_config_file_is_valid(self):
+        """
+        config/config.yaml must stay valid for both packages that read it,
+        since it is the documented starting point for users.
+        """
+        data = yaml.safe_load(_SHIPPED_CONFIG.read_text(encoding="utf-8"))
+
+        config = EmbedderConfig.model_validate(data["embedder"])
+        LoggerConfig.model_validate(data["logger"])
+
+        assert config.model_id == ["cambridgeltl/SapBERT-from-PubMedBERT-fulltext"]
+        assert set(config.revision) == set(config.model_id)
 
 
 class TestEmbedderInit:
@@ -323,18 +392,8 @@ class TestEmbedderInit:
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_accepts_a_full_configuration_dict(self, mock_st, mock_logger):
         mock_logger.config = None
-        logger_settings = {
-            "folder"       : "./logs/",
-            "file_name"    : "out.log",
-            "header_char"  : "-",
-            "header_length": 60,
-            "log_runtime"  : True,
-            "format"       : "%Y-%m-%d %H:%M:%S",
-            "encoding"     : "utf-8",
-        }
-
         embedder = Embedder(
-            config={"logger": logger_settings, "embedder": {"model_id": ["model-a"]}}
+            config={"logger": _LOGGER_SETTINGS, "embedder": {"model_id": ["model-a"]}}
         )
 
         assert set(embedder.models) == {"model-a"}
@@ -349,7 +408,9 @@ class TestEmbedderInit:
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_accepts_a_pathlib_path(self, mock_st, mock_logger, tmp_path):
         mock_logger.config = None
-        config_path = pathlib.Path(_write_config(tmp_path, model_id=["model-a"]))
+        config_path = pathlib.Path(
+            _write_config(tmp_path, logger=_LOGGER_SETTINGS, model_id=["model-a"])
+        )
 
         embedder = Embedder(config=config_path)
 
@@ -408,7 +469,7 @@ class TestEmbedderInit:
         self, mock_st, mock_logger, tmp_path
     ):
         mock_logger.config = None
-        config_path = _write_config(tmp_path, model_id=[])
+        config_path = _write_config(tmp_path, logger=_LOGGER_SETTINGS, model_id=[])
 
         Embedder(config=config_path)
 
@@ -473,6 +534,136 @@ class TestEmbedderInit:
 
         assert embedder.reducers == {}
 
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_reads_the_default_config_path(self, mock_st, tmp_path, monkeypatch):
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "config.yaml").write_text(
+            "embedder:\n  model_id: [model-a]\n  batch_size: 7\n"
+        )
+        monkeypatch.chdir(tmp_path)
+
+        embedder = Embedder()
+
+        assert embedder.config.batch_size == 7
+        assert set(embedder.models) == {"model-a"}
+
+    def test_init_raises_when_the_config_file_is_missing(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            Embedder(config=str(tmp_path / "missing.yaml"))
+
+    def test_init_raises_for_an_empty_config_file(self, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text("")
+
+        with pytest.raises(ValueError, match="no 'embedder' section"):
+            Embedder(config=str(path))
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_uses_defaults_for_an_empty_embedder_section(self, mock_st, tmp_path):
+        path = tmp_path / "config.yaml"
+        path.write_text("embedder:\n")
+
+        embedder = Embedder(config=str(path))
+
+        assert embedder.config == EmbedderConfig()
+        mock_st.assert_not_called()
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_uses_defaults_for_an_empty_section_in_a_dict(self, mock_st):
+        embedder = Embedder(config={"embedder": None})
+
+        assert embedder.config == EmbedderConfig()
+
+    def test_init_rejects_invalid_values_from_a_file(self, tmp_path):
+        config_path = _write_config(tmp_path, batch_size=0)
+
+        with pytest.raises(ValidationError, match="batch_size"):
+            Embedder(config=config_path)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_instances_do_not_share_model_registries(self, mock_st, tmp_path):
+        first  = Embedder(config=_write_config(tmp_path, model_id=["model-a"]))
+        second = Embedder(config=_write_config(tmp_path, model_id=["model-b"]))
+
+        assert set(first.models)  == {"model-a"}
+        assert set(second.models) == {"model-b"}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_keeps_case_when_the_model_has_no_tokenizer(self, mock_st, tmp_path):
+        model = MagicMock()
+        model.tokenizer = None
+        mock_st.return_value = model
+
+        embedder = Embedder(config=_write_config(tmp_path, model_id=["model-a"]))
+
+        assert embedder.lowercase == {"model-a": False}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_raises_before_loading_when_the_logger_section_is_missing(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        mock_logger.config = None
+        config_path = _write_config(tmp_path, model_id=["model-a"])
+
+        with pytest.raises(ValueError, match="no \\(or an empty\\) 'logger' section"):
+            Embedder(config=config_path)
+
+        mock_st.assert_not_called()
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_warns_when_pooling_replaces_the_models_own(
+        self, mock_st, mock_apply_pooling, mock_logger, tmp_path
+    ):
+        mock_apply_pooling.return_value = "cls"
+
+        Embedder(config=_write_config(tmp_path, model_id=["model-a"], pooling="mean"))
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert any(
+            "Warning: 'model-a': the configured 'mean' pooling replaces the model's own "
+            "'cls' pooling." in m
+            for m in logged
+        )
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_does_not_warn_when_pooling_is_unchanged(
+        self, mock_st, mock_apply_pooling, mock_logger, tmp_path
+    ):
+        mock_apply_pooling.return_value = "mean"
+
+        Embedder(config=_write_config(tmp_path, model_id=["model-a"], pooling="mean"))
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert not any("Warning" in m for m in logged)
+
+    @pytest.mark.parametrize("max_seq_length, accepted", [(512, True), (513, False)])
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_checks_max_seq_length_against_the_model(
+        self, mock_st, tmp_path, max_seq_length, accepted
+    ):
+        model = MagicMock()
+        model[0].auto_model.config.max_position_embeddings = 512
+        mock_st.return_value = model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], max_seq_length=max_seq_length
+        )
+
+        if accepted:
+            assert Embedder(config=config_path).models["model-a"].max_seq_length == 512
+        else:
+            with pytest.raises(ValueError, match="larger than the 512 tokens"):
+                Embedder(config=config_path)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_passes_openvino_backend_without_extra_settings(self, mock_st, tmp_path):
+        config_path = _write_config(tmp_path, model_id=["model-a"], backend="openvino")
+
+        Embedder(config=config_path)
+
+        mock_st.assert_called_once_with(
+            "model-a", device="cpu", revision=None, backend="openvino", model_kwargs={}
+        )
+
 
 class TestEmbed:
     """
@@ -519,6 +710,20 @@ class TestEmbed:
         encoded = fake_model.encode.call_args.args[0]
         assert encoded == ["", "0", "0.0", "False", "term"]
         assert result["model-a"].shape == (6, 4)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_treats_pandas_missing_values_as_empty(self, mock_st, tmp_path):
+        pd = pytest.importorskip("pandas")
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        config_path = _write_config(tmp_path, model_id=["model-a"])
+        embedder = Embedder(config=config_path)
+
+        terms = pd.Series(["term", pd.NA, pd.NaT, np.float32("nan"), None], dtype=object)
+        result = embedder.embed(terms)
+
+        assert fake_model.encode.call_args.args[0] == ["term", ""]
+        assert result["model-a"].shape == (5, 4)
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_encodes_duplicate_terms_once_and_keeps_input_order(
@@ -752,7 +957,7 @@ class TestEmbed:
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_repairs_a_cache_file_cut_off_by_an_interrupted_append(
-        self, mock_st, tmp_path
+        self, mock_st, mock_logger, tmp_path
     ):
         fake_model = _fake_model()
         mock_st.return_value = fake_model
@@ -774,6 +979,222 @@ class TestEmbed:
         assert fake_model.encode.call_args.args[0] == ["ccc"]
         np.testing.assert_array_equal(result["model-a"][:, 0], [1.0, 3.0])
         assert set(json.loads(cache_file.read_text())) == {"a", "bb", "ccc"}
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert f"Warning: 'model-a': cache file '{cache_file}' could only be read in " \
+               f"part; rewriting it with the 2 entries that could be read." in logged
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_with_none_returns_empty_dict(self, mock_st, tmp_path):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        embedder = Embedder(config=_write_config(tmp_path, model_id=["model-a"]))
+
+        assert embedder.embed(None) == {}
+        fake_model.encode.assert_not_called()
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_accepts_a_tuple_and_a_generator(self, mock_st, tmp_path):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        embedder = Embedder(config=_write_config(tmp_path, model_id=["model-a"]))
+
+        from_tuple     = embedder.embed(("a", "bb"))["model-a"]
+        from_generator = embedder.embed(t for t in ("a", "bb"))["model-a"]
+
+        np.testing.assert_array_equal(from_tuple, from_generator)
+        np.testing.assert_array_equal(from_tuple[:, 0], [1.0, 2.0])
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_serves_case_variants_from_one_cache_entry(self, mock_st, tmp_path):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(cache_folder), lowercase=True
+        )
+
+        Embedder(config=config_path).embed(["Seizure"])
+        Embedder(config=config_path).embed(["SEIZURE", "  seizure "])
+
+        fake_model.encode.assert_called_once()
+        cache_file, = cache_folder.glob("*.json")
+        assert set(json.loads(cache_file.read_text())) == {"seizure"}
+
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            {"revision": {"model-a": "abc123"}},
+            {"normalization": False},
+            {"max_seq_length": 64},
+            {"backend": "openvino", "quantize_int8": True},
+        ],
+    )
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_uses_a_new_cache_file_when_output_settings_change(
+        self, mock_st, tmp_path, changed
+    ):
+        mock_st.return_value = _fake_model()
+        cache_folder = tmp_path / "cache"
+
+        for overrides in ({}, changed):
+            config_path = _write_config(
+                tmp_path, model_id=["model-a"], cache_folder=str(cache_folder), **overrides
+            )
+            Embedder(config=config_path).embed(["a"])
+
+        assert len(list(cache_folder.glob("*.json"))) == 2
+
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            {"backend": "openvino"},
+            {"lowercase": True},
+            {"cache_decimals": 3},
+            {"batch_size": 8},
+            {"progress_interval": 5},
+        ],
+    )
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_the_cache_file_when_other_settings_change(
+        self, mock_st, tmp_path, changed
+    ):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        cache_folder = tmp_path / "cache"
+
+        for overrides in ({}, changed):
+            config_path = _write_config(
+                tmp_path, model_id=["model-a"], cache_folder=str(cache_folder), **overrides
+            )
+            Embedder(config=config_path).embed(["a"])
+
+        assert len(list(cache_folder.glob("*.json"))) == 1
+        fake_model.encode.assert_called_once()
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_names_cache_files_safely_for_the_file_system(self, mock_st, tmp_path):
+        mock_st.return_value = _fake_model()
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["org/model name"], cache_folder=str(cache_folder)
+        )
+
+        Embedder(config=config_path).embed(["a"])
+
+        # One file directly in the cache folder, not a subfolder per "/".
+        cache_file, = cache_folder.iterdir()
+        assert cache_file.is_file()
+        assert cache_file.name.startswith("org_model_name-")
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_one_cache_file_per_model(self, mock_st, tmp_path):
+        mock_st.side_effect = [_fake_model(), _fake_model()]
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a", "model-b"], cache_folder=str(cache_folder)
+        )
+
+        Embedder(config=config_path).embed(["a", "bb"])
+
+        files = sorted(cache_folder.glob("*.json"))
+        assert [f.name.split("-")[1] for f in files] == ["a", "b"]
+        for cache_file in files:
+            assert set(json.loads(cache_file.read_text())) == {"a", "bb"}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_logs_cache_hits_and_does_not_rewrite_an_intact_cache(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        mock_st.return_value = _fake_model()
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(tmp_path / "cache")
+        )
+        Embedder(config=config_path).embed(["a"])
+        mock_logger.return_value.log.reset_mock()
+
+        Embedder(config=config_path).embed(["a", "bb", "bb"])
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert any("1 distinct term(s) loaded from cache, 1 to encode" in m for m in logged)
+        assert not any("read in part" in m for m in logged)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_the_text_of_an_array_term(self, mock_st, tmp_path):
+        fake_model = _fake_model()
+        mock_st.return_value = fake_model
+        embedder = Embedder(config=_write_config(tmp_path, model_id=["model-a"]))
+
+        embedder.embed([np.array([1, 2])])
+
+        assert fake_model.encode.call_args.args[0] == ["[1 2]"]
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_returns_but_does_not_cache_non_finite_vectors(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        fake_model = MagicMock()
+        fake_model.encode.side_effect = lambda terms, **kwargs: np.array(
+            [[np.nan if t == "bad" else 1.0] * 4 for t in terms], dtype=np.float32
+        )
+        mock_st.return_value = fake_model
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(cache_folder)
+        )
+
+        result = Embedder(config=config_path).embed(["good", "bad"])["model-a"]
+
+        assert np.isnan(result[1]).all() and np.isfinite(result[0]).all()
+        cache_file, = cache_folder.glob("*.json")
+        assert set(json.loads(cache_file.read_text())) == {"good"}
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert any("NaN or infinite values for 1 term(s) ('bad'); they are not cached" in m
+                   for m in logged)
+
+        # The next run finds an intact cache and only encodes "bad" again.
+        mock_logger.return_value.log.reset_mock()
+        Embedder(config=config_path).embed(["good", "bad"])
+
+        assert fake_model.encode.call_args.args[0] == ["bad"]
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert not any("read in part" in m for m in logged)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_warns_about_non_finite_vectors_without_a_cache(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        fake_model = MagicMock()
+        fake_model.encode.side_effect = lambda terms, **kwargs: np.full(
+            (len(terms), 4), np.inf, dtype=np.float32
+        )
+        mock_st.return_value = fake_model
+        terms = [f"t{i}" for i in range(7)]
+
+        Embedder(config=_write_config(tmp_path, model_id=["model-a"])).embed(terms)
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert any(
+            m.endswith("for 7 term(s) ('t0', 't1', 't2', 't3', 't4', ...).") for m in logged
+        )
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_exact_values_when_cache_decimals_is_none(self, mock_st, tmp_path):
+        fake_model = MagicMock()
+        fake_model.encode.side_effect = lambda terms, **kwargs: np.full(
+            (len(terms), 4), 1 / 3, dtype=np.float32
+        )
+        mock_st.return_value = fake_model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(tmp_path / "cache"),
+            cache_decimals=None,
+        )
+
+        first  = Embedder(config=config_path).embed(["a"])["model-a"]
+        second = Embedder(config=config_path).embed(["a"])["model-a"]
+
+        np.testing.assert_array_equal(first, np.float32(1 / 3))
+        np.testing.assert_array_equal(second, first)
+
 
 class TestReduce:
     """
@@ -818,7 +1239,7 @@ class TestReduce:
     @patch.object(_EMBEDDER_MODULE, "umap")
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_reduce_skips_inputs_below_n_components_plus_two(
-        self, mock_st, mock_umap, tmp_path
+        self, mock_st, mock_umap, mock_logger, tmp_path
     ):
         """
         UMAP's spectral initialisation fails with n_components + 1 points
@@ -836,6 +1257,10 @@ class TestReduce:
 
         mock_umap.UMAP.return_value.fit_transform.assert_not_called()
         np.testing.assert_array_equal(result["model-a"], full["model-a"])
+        mock_logger.return_value.log.assert_called_with(
+            "Warning: 'model-a': 3 row(s) given, at least 4 needed for dimensionality "
+            "reduction; returning the full-dimensional embeddings."
+        )
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_reduce_raises_when_dimensionality_reduction_disabled(self, mock_st, tmp_path):
@@ -847,6 +1272,52 @@ class TestReduce:
 
         with pytest.raises(RuntimeError, match="disabled"):
             embedder.reduce({"model-a": np.ones((10, 384))})
+
+    @pytest.mark.parametrize("rows, reduced", [(4, False), (5, True)])
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_reduce_threshold_follows_n_components(
+        self, mock_st, mock_umap, tmp_path, rows, reduced
+    ):
+        """
+        With n_components = 3, five rows (n_components + 2) is the smallest
+        input that gets reduced.
+        """
+        reducer = mock_umap.UMAP.return_value
+        reducer.fit_transform.return_value = np.zeros((rows, 3))
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=True, n_components=3
+        )
+        embedder = Embedder(config=config_path)
+
+        result = embedder.reduce({"model-a": np.ones((rows, 384))})
+
+        assert reducer.fit_transform.called is reduced
+        assert result["model-a"].shape == ((rows, 3) if reduced else (rows, 384))
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_reduce_raises_for_a_model_that_was_not_loaded(
+        self, mock_st, mock_umap, tmp_path
+    ):
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=True
+        )
+        embedder = Embedder(config=config_path)
+
+        with pytest.raises(KeyError, match="model-b"):
+            embedder.reduce({"model-b": np.ones((10, 384))})
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_reduce_of_an_empty_dict_returns_an_empty_dict(
+        self, mock_st, mock_umap, tmp_path
+    ):
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], dimensionality_reduction=True
+        )
+
+        assert Embedder(config=config_path).reduce({}) == {}
 
 
 class TestCacheFile:
@@ -955,6 +1426,216 @@ class TestCacheFile:
         np.testing.assert_array_equal(loaded["a"], [1.5, 2.5])
         np.testing.assert_array_equal(loaded["b"], [3.0, 4.0])
 
+    def test_save_to_a_file_name_without_folder(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        Embedder.save_cache("cache.json", {"a": np.ones(2, dtype=np.float32)})
+
+        assert set(Embedder.load_cache(str(tmp_path / "cache.json"))) == {"a"}
+
+    def test_save_keeps_non_ascii_terms_readable(self, tmp_path):
+        path = tmp_path / "cache.json"
+
+        Embedder.save_cache(str(path), {"Ödem": np.ones(2, dtype=np.float32)})
+
+        assert '"Ödem"' in path.read_text(encoding="utf-8")
+
+    def test_append_of_no_entries_leaves_the_file_unchanged(self, tmp_path):
+        path = tmp_path / "cache.json"
+        Embedder.save_cache(str(path), {"a": np.ones(2, dtype=np.float32)})
+        before = path.read_bytes()
+
+        Embedder.append_cache(str(path), {})
+        Embedder.append_cache(str(tmp_path / "missing.json"), {})
+
+        assert path.read_bytes() == before
+        assert not (tmp_path / "missing.json").exists()
+
+    def test_append_rounds_to_the_given_decimals(self, tmp_path):
+        path = str(tmp_path / "cache.json")
+        Embedder.save_cache(path, {})
+
+        Embedder.append_cache(path, {"a": np.array([1 / 3], dtype=np.float32)}, decimals=2)
+
+        assert json.loads(open(path, encoding="utf-8").read()) == {"a": [0.33]}
+
+    def test_appended_duplicate_term_wins_when_loaded(self, tmp_path):
+        path = str(tmp_path / "cache.json")
+        Embedder.save_cache(path, {"a": np.zeros(2, dtype=np.float32)})
+
+        Embedder.append_cache(path, {"a": np.ones(2, dtype=np.float32)})
+
+        np.testing.assert_array_equal(Embedder.load_cache(path)["a"], [1.0, 1.0])
+
+    def test_append_to_a_pretty_printed_file(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text(json.dumps({"a": [1.0, 2.0]}, indent=2))
+
+        Embedder.append_cache(str(path), {"b": np.array([3.0, 4.0], dtype=np.float32)})
+
+        assert json.loads(path.read_text()) == {"a": [1.0, 2.0], "b": [3.0, 4.0]}
+        np.testing.assert_array_equal(Embedder.load_cache(str(path))["b"], [3.0, 4.0])
+
+    def test_save_refuses_non_finite_values_and_keeps_the_previous_file(self, tmp_path):
+        path = str(tmp_path / "cache.json")
+        Embedder.save_cache(path, {"a": np.ones(2, dtype=np.float32)})
+
+        with pytest.raises(ValueError, match="NaN or infinity"):
+            Embedder.save_cache(path, {"b": np.array([np.nan, 1.0], dtype=np.float32)})
+        with pytest.raises(ValueError, match="NaN or infinity"):
+            Embedder.append_cache(path, {"c": np.array([np.inf], dtype=np.float32)})
+
+        assert set(json.loads(open(path, encoding="utf-8").read())) == {"a"}
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[1, 2]",                       # not a JSON object
+            '{"a": 5}',                     # a number instead of a list
+            '{"a": {"x": 1}}',              # a nested object
+            '{"a": []}',                    # an empty list
+            '{"a": [NaN, 1.0]}',            # Python's json accepts NaN
+            '{"a": ["x", "y"]}',            # strings
+            "",                             # an empty file
+        ],
+    )
+    def test_load_rejects_files_that_are_not_term_to_vector_objects(self, tmp_path, text):
+        path = tmp_path / "cache.json"
+        path.write_text(text)
+
+        with pytest.raises(ValueError, match="could not be read"):
+            Embedder.load_cache(str(path))
+
+    def test_line_with_a_number_instead_of_a_list_counts_as_broken(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text('{\n"a": 5,\n"b": [1.0,2.0]\n}\n')
+
+        cache, intact = Embedder._read_cache(str(path))
+
+        assert set(cache) == {"b"}
+        assert intact is False
+
+    def test_broken_line_before_the_closing_brace_marks_the_file_incomplete(self, tmp_path):
+        path = tmp_path / "cache.json"
+        path.write_text('{\n"a": [1.0],\n"b": [2.\n"c": [3.0]\n}\n')
+
+        cache, intact = Embedder._read_cache(str(path))
+
+        assert set(cache) == {"a", "c"}
+        assert intact is False
+
+
+class TestLogMessages:
+    """
+    Tests that the log messages follow one structure: start and end of a
+    step as "<Action>..." and "<Action> completed.", messages about one
+    model as "'<model_id>': ...", and warnings prefixed with "Warning: ".
+    """
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "torch")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_messages_and_their_order(
+        self, mock_st, mock_torch, mock_umap, mock_apply_pooling, mock_logger, tmp_path
+    ):
+        model = _fake_model()
+        model.tokenizer.do_lower_case = True
+        mock_st.return_value = model
+        mock_apply_pooling.return_value = "cls"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], revision={"model-a": "abc123"},
+            num_threads=2, dimensionality_reduction=True,
+        )
+
+        Embedder(config=config_path)
+
+        assert [c.args[0] for c in mock_logger.return_value.log.call_args_list] == [
+            "Limiting the model(s) to 2 CPU thread(s).",
+            "Loading model(s)...",
+            "Loading embedding model 'model-a' (revision 'abc123', pooling 'mean', "
+            "backend 'torch', device 'cpu')...",
+            "Warning: 'model-a': the configured 'mean' pooling replaces the model's own "
+            "'cls' pooling.",
+            "Loading embedding model 'model-a' completed (terms are lowercased).",
+            "Loading model(s) completed.",
+            "Creating UMAP reducer(s)...",
+            "Creating UMAP reducer(s) completed.",
+        ]
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_messages_without_models(self, mock_st, mock_logger, tmp_path):
+        Embedder(config=_write_config(tmp_path, model_id=[], dimensionality_reduction=True))
+
+        assert [c.args[0] for c in mock_logger.return_value.log.call_args_list] == [
+            "Loading model(s)...",
+            "No model specified.",
+            "Loading model(s) completed.",
+        ]
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_unpinned_openvino_int8_model_is_described_in_the_loading_message(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        Embedder(config=_write_config(
+            tmp_path, model_id=["model-a"], backend="openvino", quantize_int8=True
+        ))
+
+        mock_logger.return_value.log.assert_any_call(
+            "Loading embedding model 'model-a' (revision 'not pinned', pooling 'mean', "
+            "backend 'openvino int8', device 'cpu')..."
+        )
+
+    @patch.object(_EMBEDDER_MODULE, "umap")
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_all_messages_follow_the_structure(
+        self, mock_st, mock_umap, mock_apply_pooling, mock_logger, tmp_path
+    ):
+        """
+        Run every path that logs (pooling warning, cache hits, progress,
+        non-finite vectors, cache repair, skipped reduction) and check the
+        structure of each message.
+        """
+        model = MagicMock()
+        model.encode.side_effect = lambda terms, **kwargs: np.array(
+            [[np.nan if t == "bad" else 1.0] * 4 for t in terms], dtype=np.float32
+        )
+        mock_st.return_value = model
+        mock_apply_pooling.return_value = "cls"
+        cache_folder = tmp_path / "cache"
+        config_path = _write_config(
+            tmp_path, model_id=["model-a"], cache_folder=str(cache_folder),
+            dimensionality_reduction=True, progress_interval=1,
+        )
+        embedder = Embedder(config=config_path)
+        embedder.embed(["good", "bad"])
+        cache_file, = cache_folder.glob("*.json")
+        cache_file.write_text(cache_file.read_text().rstrip().rstrip("}"))
+        embedder.reduce(embedder.embed(["good", "other"]))
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        warnings = [m for m in logged if m.startswith("Warning: ")]
+        # Pooling, NaN, cache repair and skipped reduction.
+        assert len(warnings) == 4
+        for message in logged:
+            assert message.endswith((".", "...")), message
+            assert "Warning" not in message or message in warnings, message
+        for message in warnings:
+            assert re.match(r"Warning: 'model-a': \S", message), message
+        for message in logged:
+            if "encoded" in message or "from cache" in message:
+                assert message.startswith("'model-a': "), message
+
+
+class TestPackage:
+    """
+    Tests for what the embedder package exports.
+    """
+
+    def test_exports_embedder_and_config(self):
+        assert embedder.__all__ == ["Embedder", "EmbedderConfig"]
+        assert embedder.Embedder is Embedder
+        assert embedder.EmbedderConfig is EmbedderConfig
+
 
 class TestApplyPooling:
     """
@@ -973,6 +1654,12 @@ class TestApplyPooling:
         assert isinstance(model[1], Pooling)
         assert model[1].get_config_dict()["pooling_mode"] == "cls"
         assert model[1].get_config_dict()["embedding_dimension"] == 384
+
+    def test_returns_the_pooling_mode_the_model_came_with(self):
+        Pooling = _EMBEDDER_MODULE.Pooling
+        model = [MagicMock(), Pooling(384, pooling_mode="cls")]
+
+        assert _REAL_APPLY_POOLING(model, "mean") == "cls"
 
     def test_raises_when_the_model_has_no_pooling_module(self):
         with pytest.raises(ValueError, match="no pooling module"):
@@ -1045,6 +1732,27 @@ class TestRealModel:
 
         assert vectors["mean"].shape == vectors["cls"].shape == (1, 384)
         assert not np.allclose(vectors["mean"], vectors["cls"])
+
+    def test_pooling_warning_and_max_seq_length_check_with_a_real_model(
+        self, tmp_path, mock_apply_pooling, mock_logger
+    ):
+        mock_apply_pooling.side_effect = _REAL_APPLY_POOLING
+        # all-MiniLM-L6-v2 was trained with mean pooling and has 512
+        # position embeddings.
+        Embedder(config=_write_config(
+            tmp_path, model_id=[self.MODEL_ID], revision={self.MODEL_ID: self.REVISION},
+            pooling="cls", max_seq_length=512,
+        ))
+
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert any("the configured 'cls' pooling replaces the model's own 'mean'" in m
+                   for m in logged)
+
+        with pytest.raises(ValueError, match="larger than the 512 tokens"):
+            Embedder(config=_write_config(
+                tmp_path, model_id=[self.MODEL_ID], revision={self.MODEL_ID: self.REVISION},
+                max_seq_length=1024,
+            ))
 
     def test_openvino_backend_matches_torch(self, tmp_path):
         # Needs the "openvino" extra; skipped where it is not installed.

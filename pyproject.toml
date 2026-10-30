@@ -1,13 +1,17 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+# 77 added SPDX license expressions (the `license` field below).
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "embedder"
 description = "Configuration-driven Sentence Transformers embeddings with optional UMAP dimensionality reduction."
 readme = "README.md"
-version = "2.1.0"
+version = "2.1.1"
 requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "Peter Pallaoro", email = "peter.pallaoro@tum.de" }]
 dependencies = [
     "logger @ git+https://github.com/Goldkugel/logger.git@v1.1.0",
     "numpy>=1.24,<3",
@@ -18,8 +22,12 @@ dependencies = [
     "umap-learn>=0.5.4,<0.6",
 ]
 
+[project.urls]
+Repository = "https://github.com/Goldkugel/embedder"
+
 [project.optional-dependencies]
-test = ["pytest"]
+# pandas is only used to test that pandas missing values are handled.
+test = ["pandas", "pytest>=6", "pytest-cov"]
 # OpenVINO backend (backend: "openvino" in the configuration).
 openvino = ["sentence-transformers[openvino]>=3.2,<7"]
 
@@ -30,6 +38,10 @@ packages = ["embedder"]
 "embedder" = "src"
 
 [tool.pytest.ini_options]
+# The test files are named *Test.py, which pytest does not collect by
+# default; with these settings a plain `pytest` finds them.
+testpaths = ["tests"]
+python_files = ["*Test.py"]
 # The real-model smoke test is marked "slow" and skipped by default, so a
 # plain `pytest` run needs no download; `pytest -m slow` runs only that test.
 markers = [

@@ -21,7 +21,7 @@ A flexible, configuration-driven Python library for encoding textual terms into 
 ```
 .
 ├── .github/workflows/
-│   └── tests.yml            # CI: fast tests on Python 3.10/3.11/3.14, plus a real-model smoke test
+│   └── tests.yml            # CI: fast tests on Python 3.10/3.11/3.14, plus real-model smoke tests
 ├── config/
 │   ├── config.yaml          # Configuration with "embedder" and "logger" sections
 │   └── README.md            # Configuration reference
@@ -100,9 +100,9 @@ embedder:
 
 See [`config/README.md`](./config/README.md) for the meaning, defaults and valid range of every field.
 
-If `dimensionality_reduction` is enabled, each model gets its own UMAP reducer, which is **fitted afresh on every `reduce()` call**. Reduced coordinates are therefore only comparable within the output of a single call; reduce all terms you want to compare in one call. The reducer is only applied when there are at least `n_components + 2` rows (UMAP's spectral initialization fails on fewer points); with fewer rows, the full-dimensional embeddings are returned for that call and a message is logged.
+If `dimensionality_reduction` is enabled, each model gets its own UMAP reducer, which is **fitted afresh on every `reduce()` call**. Reduced coordinates are therefore only comparable within the output of a single call; reduce all terms you want to compare in one call. The reducer is only applied when there are at least `n_components + 2` rows (UMAP's spectral initialization fails on fewer points); with fewer rows, the full-dimensional embeddings are returned for that call and a warning is logged.
 
-The logger is a process-wide singleton (see the `logger` package). If it has not been configured yet when an `Embedder` is created, it is configured from the same YAML file as the embedder, so that file also needs a `logger` section.
+The logger is a process-wide singleton (see the `logger` package). If it has not been configured yet when an `Embedder` is created, it is configured from the same YAML file as the embedder, so that file also needs a `logger` section; without it, `Embedder` raises a `ValueError` before loading any model.
 
 ## Usage
 
@@ -140,8 +140,8 @@ terms = [
 ]
 
 # Accepts a list, tuple, numpy array or pandas Series; a single string is
-# treated as one term. None and NaN become "", any other value is converted
-# with str().
+# treated as one term. Missing values (None, NaN, pd.NA, NaT) become "", any
+# other value is converted with str().
 # Returns a dict mapping model_id -> numpy.ndarray (one row per term, in order)
 # with the model's full dimension (768 for SapBERT).
 embeddings_map = embedder.embed(terms)
@@ -181,21 +181,21 @@ print(f"Batch size: {config.batch_size}")
 
 ## Running Unit Tests
 
-`tests/EmbedderTest.py` imports the installed `embedder` package, so install it first (`pip install ".[test]"`).
+The tests import the installed `embedder` package, so install it first (`pip install ".[test]"`). Run them from the repository root: pytest collects every `tests/*Test.py` file (configured in `pyproject.toml`), and one test checks the shipped `config/config.yaml`.
 
 By default, only the fast tests run. They mock `SentenceTransformer`, `umap.UMAP` and `Logger` to test config validation, model/reducer initialization, `embed()`, the cache files, progress checkpoints and `reduce()`, without downloading models or writing log files:
 
 ```bash
-pytest tests/EmbedderTest.py -v
+pytest -v
 ```
 
-Three slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries, check that the pooling setting takes effect, and compare the OpenVINO backend with torch (skipped unless the `openvino` extra is installed):
+Four slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries, check that the pooling setting takes effect, check the pooling warning and the `max_seq_length` limit against the real model, and compare the OpenVINO backend with torch (skipped unless the `openvino` extra is installed):
 
 ```bash
-pytest tests/EmbedderTest.py -v -m slow
+pytest -v -m slow
 ```
 
-Both run automatically on GitHub Actions on every push and pull request.
+Both run automatically on GitHub Actions on every push and pull request; the fast tests also report line and branch coverage (`--cov=embedder --cov-branch`) in the job log and on the run's summary page.
 
 ## License
 

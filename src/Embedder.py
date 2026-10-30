@@ -15,7 +15,6 @@ from .EmbedderConfig       import EmbedderConfig
 from logger                import Logger, LoggerConfig
 import hashlib
 import json
-import math
 import os
 import re
 import numpy as np
@@ -42,12 +41,24 @@ standard_directory: str    = "./config/config.yaml"
 
 def _to_text(term) -> str:
     """
-    Coerce a single term to a string for the model. None and NaN (e.g.
-    missing values from a pandas column) become an empty string; every
-    other value, including falsy ones like 0 or False, keeps its string form.
+    Coerce a single term to a string for the model. Missing values — None,
+    NaN of any float type, and pandas' NA and NaT — become an empty string;
+    every other value, including falsy ones like 0 or False and array-like
+    values, keeps its string form.
     """
-    if term is None or (isinstance(term, float) and math.isnan(term)):
+    if term is None:
         return ""
+    try:
+        # NaN and NaT are the only common values not equal to themselves.
+        if term != term:
+            return ""
+    except TypeError:
+        # pd.NA: comparing it gives pd.NA again, whose truth value raises.
+        return ""
+    except ValueError:
+        # A numpy array compares element-wise, and the truth value of the
+        # result raises; it is not a missing value, so keep its text.
+        pass
     return str(term)
 
 
@@ -121,6 +132,15 @@ class Embedder:
         # embedder: the same YAML file, or the "logger" key of the same
         # dict. Without either, Logger() falls back to ./config/config.yaml.
         if Logger.config is None and logger_path is not None:
+            # Checked here because the logger package would only raise a
+            # bare KeyError('logger').
+            if logger_settings is None:
+                raise ValueError(
+                    f"Configuration file '{logger_path}' has no (or an empty) "
+                    f"'{logger_section}' section, and the logger has not been "
+                    f"configured yet. Add the section, or configure the logger "
+                    f"first with Logger(<path>)."
+                )
             l = Logger(logger_path)
         else:
             if Logger.config is None and logger_settings is not None:
@@ -128,26 +148,30 @@ class Embedder:
             l = Logger()
 
         # Limit PyTorch's CPU threads before any model runs, so a large job
-        # does not occupy every core of a shared machine.
+        # does not occupy every core of a shared machine. The OpenVINO
+        # backend gets the same limit in _backend_arguments().
         if self.config.num_threads is not None:
             torch.set_num_threads(self.config.num_threads)
-            l.log(f"Limiting PyTorch to {self.config.num_threads} CPU thread(s).")
+            l.log(f"Limiting the model(s) to {self.config.num_threads} CPU thread(s).")
 
         l.log("Loading model(s)...")
 
-        if self.config.model_id:
+        if not self.config.model_id:
+            l.log("No model specified.")
+        else:
             # Load each configured SentenceTransformer model and store it
             # in self.models, keyed by its model ID, so embed() can iterate
             # over all of them and return per-model results.
             for model_id in self.config.model_id:
-                # None (no entry in the config) loads the latest revision.
+                # None (no entry in the config) loads the latest revision
+                # from the Hub, or whatever a local path contains.
                 revision = self.config.revision.get(model_id)
                 l.log(
                     f"Loading embedding model '{model_id}' (revision "
-                    f"'{revision or 'latest'}', pooling '{self.config.pooling}', "
+                    f"'{revision or 'not pinned'}', pooling '{self.config.pooling}', "
                     f"backend '{self.config.backend}"
-                    f"{' int8' if self.config.quantize_int8 else ''}') "
-                    f"on device '{self.config.device}'..."
+                    f"{' int8' if self.config.quantize_int8 else ''}', "
+                    f"device '{self.config.device}')..."
                 )
                 model = SentenceTransformer(
                     model_id,
@@ -155,7 +179,24 @@ class Embedder:
                     revision = revision,
                     **self._backend_arguments(),
                 )
-                Embedder._apply_pooling(model, self.config.pooling)
+                previous = Embedder._apply_pooling(model, self.config.pooling)
+                if isinstance(previous, str) and previous != self.config.pooling:
+                    # Not an error (e.g. SapBERT gets sentence-transformers'
+                    # "mean" fallback, but was trained with "cls"), but a
+                    # model trained with another pooling gives worse vectors.
+                    l.log(
+                        f"Warning: '{model_id}': the configured '{self.config.pooling}' "
+                        f"pooling replaces the model's own '{previous}' pooling."
+                    )
+
+                # A longer max_seq_length than the model has position
+                # embeddings for would only fail once a long term arrives.
+                limit = Embedder._max_positions(model)
+                if limit is not None and self.config.max_seq_length > limit:
+                    raise ValueError(
+                        f"max_seq_length {self.config.max_seq_length} is larger than "
+                        f"the {limit} tokens model '{model_id}' supports."
+                    )
 
                 # Override the model's default max sequence length with the
                 # configured value — inputs longer than this are truncated.
@@ -177,25 +218,23 @@ class Embedder:
                     f"{'lowercased' if self.lowercase[model_id] else 'kept cased'})."
                 )
 
-            if self.config.dimensionality_reduction:
-                # Initialise one UMAP reducer per model with the configured
-                # parameters, so fitting on one model's embeddings never
-                # overwrites the fitted state belonging to another model.
-                # Each reducer is fitted inside reduce() (via fit_transform).
-                l.log("Loading reducer(s)...")
-                for model_id in self.models:
-                    self.reducers[model_id] = umap.UMAP(
-                        n_components = self.config.n_components,
-                        n_neighbors  = self.config.n_neighbors,
-                        min_dist     = self.config.min_dist,
-                        metric       = self.config.metric,
-                        random_state = self.config.random_state,
-                    )
-                l.log("Loading reducer(s) completed.")
-        else:
-            l.log("No model specified.")
-
         l.log("Loading model(s) completed.")
+
+        if self.config.dimensionality_reduction and self.models:
+            # Initialise one UMAP reducer per model with the configured
+            # parameters, so fitting on one model's embeddings never
+            # overwrites the fitted state belonging to another model.
+            # Each reducer is fitted inside reduce() (via fit_transform).
+            l.log("Creating UMAP reducer(s)...")
+            for model_id in self.models:
+                self.reducers[model_id] = umap.UMAP(
+                    n_components = self.config.n_components,
+                    n_neighbors  = self.config.n_neighbors,
+                    min_dist     = self.config.min_dist,
+                    metric       = self.config.metric,
+                    random_state = self.config.random_state,
+                )
+            l.log("Creating UMAP reducer(s) completed.")
 
     def embed(self, terms: str | Iterable) -> dict:
         """
@@ -219,8 +258,9 @@ class Embedder:
         ----------
         terms : str or Iterable
             Text strings to embed — a list, tuple, numpy array or pandas
-            Series. A single string is treated as one term. None and NaN
-            become an empty string; any other value is converted with str().
+            Series. A single string is treated as one term. Missing values
+            (None, NaN, pd.NA, NaT) become an empty string; any other value
+            is converted with str().
 
         Returns
         -------
@@ -242,7 +282,7 @@ class Embedder:
 
         if self.models and terms:
             # Coerce all term values to strings so the model never receives
-            # unexpected types (e.g. None, NaN, int) from upstream callers.
+            # unexpected types (e.g. None, NaN, pd.NA, int) from upstream callers.
             terms = [_to_text(t) for t in terms]
 
             for model_name, model in self.models.items():
@@ -258,11 +298,13 @@ class Embedder:
                     cache, intact = Embedder._read_cache(cache_path)
                     if not intact:
                         # An append was interrupted (e.g. the job was
-                        # killed). Rewrite the file from the entries that
-                        # could be read, so new entries can be appended.
+                        # killed), or a line is malformed. Rewrite the file
+                        # from the entries that could be read, so new
+                        # entries can be appended.
                         Logger().log(
-                            f"Cache file '{cache_path}' was incomplete; rewriting it "
-                            f"with the {len(cache)} entries that could be read."
+                            f"Warning: '{model_name}': cache file '{cache_path}' could "
+                            f"only be read in part; rewriting it with the {len(cache)} "
+                            f"entries that could be read."
                         )
                         Embedder.save_cache(cache_path, cache)
 
@@ -328,10 +370,9 @@ class Embedder:
                 ret[model_name] = reducer.fit_transform(vectors)
             else:
                 Logger().log(
-                    f"Skipping dimensionality reduction for '{model_name}': "
-                    f"{len(vectors)} row(s) given, at least "
-                    f"{self.config.n_components + 2} needed. Returning "
-                    f"full-dimensional embeddings."
+                    f"Warning: '{model_name}': {len(vectors)} row(s) given, at least "
+                    f"{self.config.n_components + 2} needed for dimensionality "
+                    f"reduction; returning the full-dimensional embeddings."
                 )
                 ret[model_name] = vectors
 
@@ -508,7 +549,7 @@ class Embedder:
                         continue
                     try:
                         (term, vector), = json.loads("{" + line + "}").items()
-                        cache[term] = np.asarray(vector, dtype=np.float32)
+                        cache[term] = Embedder._cache_vector(vector)
                     except ValueError:
                         broken_lines += 1
             if closed and broken_lines == 0:
@@ -518,22 +559,54 @@ class Embedder:
         # read it whole.
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return {t: np.asarray(v, dtype=np.float32) for t, v in json.load(f).items()}, True
-        except ValueError:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("not a JSON object")
+            return {t: Embedder._cache_vector(v) for t, v in data.items()}, True
+        except ValueError as e:
             if not line_layout:
-                raise ValueError(f"Cache file '{path}' could not be read.")
+                raise ValueError(f"Cache file '{path}' could not be read ({e}).") from e
 
         # The line layout without a closing brace (or with a broken last
         # line): an interrupted append. Keep every complete entry.
         return cache, False
 
     @staticmethod
+    def _cache_vector(value) -> np.ndarray:
+        """
+        Convert one value read from a cache file to a float32 vector.
+
+        Raises
+        ------
+        ValueError
+            If the value is not a non-empty list of finite numbers (e.g. a
+            single number in a file edited by hand), which would otherwise
+            only fail later, when embed() stacks the vectors.
+        """
+        try:
+            vector = np.asarray(value, dtype=np.float32)
+        except TypeError:
+            # e.g. a nested object, which numpy rejects with a TypeError.
+            raise ValueError("an embedding is not a list of finite numbers") from None
+        if vector.ndim != 1 or vector.size == 0 or not np.isfinite(vector).all():
+            raise ValueError("an embedding is not a list of finite numbers")
+        return vector
+
+    @staticmethod
     def _cache_entry(term: str, vector, decimals: int | None) -> str:
         """
         Format one cache entry as `"term": [v1,v2,...]` (without a trailing
         comma or newline).
+
+        Raises
+        ------
+        ValueError
+            If the vector contains NaN or infinity, which JSON cannot hold
+            (the entry would make its line, and the file, unreadable).
         """
         vector = np.asarray(vector, dtype=np.float32)
+        if not np.isfinite(vector).all():
+            raise ValueError(f"Embedding of {term!r} contains NaN or infinity.")
         if decimals is not None:
             vector = np.round(vector, decimals)
         # astype(str) on float32 gives the shortest text that reads back to
@@ -553,6 +626,10 @@ class Embedder:
         With caching enabled, the vectors are rounded to `cache_decimals`
         before being added, so `cache` holds exactly what a later run reads
         back from the file.
+
+        Vectors containing NaN or infinity (e.g. after a float16 overflow on
+        a GPU) are still returned, but logged and not written to the cache
+        file, which could not hold them.
         """
         total = len(terms)
         interval = self.config.progress_interval
@@ -574,6 +651,17 @@ class Embedder:
                 vectors = np.round(vectors, self.config.cache_decimals)
             entries = dict(zip(chunk, vectors))
             cache.update(entries)
+
+            invalid = [t for t, v in entries.items() if not np.isfinite(v).all()]
+            if invalid:
+                shown = ", ".join(repr(t) for t in invalid[:5])
+                Logger().log(
+                    f"Warning: '{model_name}': NaN or infinite values for "
+                    f"{len(invalid)} term(s) ({shown}{', ...' if len(invalid) > 5 else ''})"
+                    f"{'; they are not cached' if cache_path is not None else ''}."
+                )
+                for term in invalid:
+                    del entries[term]
 
             done = start + len(chunk)
             Logger().log(
@@ -646,8 +734,9 @@ class Embedder:
         Turn the `config` argument of __init__ into an EmbedderConfig.
 
         Returns the EmbedderConfig, the YAML file it came from (or None),
-        and the "logger" section of a full configuration dict (or None),
-        so __init__ can configure the logger from the same source.
+        and the "logger" section of that file or of a full configuration
+        dict (or None), so __init__ can configure the logger from the same
+        source.
         """
         if isinstance(config, EmbedderConfig):
             return config, None, None
@@ -672,14 +761,24 @@ class Embedder:
             )
         # A section that is present but empty (`embedder:` with nothing
         # below it) also parses to None; treat it as "use all defaults".
-        return EmbedderConfig.model_validate(data[configuration_section] or {}), path, None
+        return (
+            EmbedderConfig.model_validate(data[configuration_section] or {}),
+            path,
+            data.get(logger_section),
+        )
 
     @staticmethod
-    def _apply_pooling(model, pooling: str) -> None:
+    def _apply_pooling(model, pooling: str) -> str | None:
         """
         Replace the pooling module of a loaded SentenceTransformer with one
         using `pooling`, keeping every other module (e.g. a Normalize step)
         unchanged.
+
+        Returns
+        -------
+        str or None
+            The pooling mode the model came with, or None if it cannot be
+            read.
 
         Raises
         ------
@@ -688,8 +787,25 @@ class Embedder:
         """
         for index, module in enumerate(model):
             if isinstance(module, Pooling):
+                # sentence-transformers 6 stores the mode as one string;
+                # older versions as flags, readable with get_pooling_mode_str().
+                previous = module.get_config_dict().get("pooling_mode")
+                if previous is None and hasattr(module, "get_pooling_mode_str"):
+                    previous = module.get_pooling_mode_str()
                 # sentence-transformers 6 renamed this attribute.
                 dimension = getattr(module, "embedding_dimension", None) or module.word_embedding_dimension
                 model[index] = Pooling(dimension, pooling_mode=pooling)
-                return
+                return previous
         raise ValueError("The model has no pooling module to configure.")
+
+    @staticmethod
+    def _max_positions(model) -> int | None:
+        """
+        Return the number of position embeddings of a loaded model's
+        transformer, the longest input in tokens it can take, or None if
+        the model does not say (e.g. a model without a Transformer module).
+        """
+        transformer = model[0]
+        config = getattr(getattr(transformer, "auto_model", None), "config", None)
+        value = getattr(config, "max_position_embeddings", None)
+        return value if isinstance(value, int) else None

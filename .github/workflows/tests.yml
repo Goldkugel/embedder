@@ -4,6 +4,9 @@
 # run also checks that pyproject.toml declares all runtime dependencies.
 # PyTorch is installed from its CPU-only index first: the default PyPI wheel
 # bundles CUDA libraries (several GB) that the CPU-only runners never use.
+# Tests are run from the repository root; pytest collects every
+# tests/*Test.py file as set in pyproject.toml, so new test files are run
+# without changing this workflow.
 
 name: Tests
 
@@ -38,12 +41,26 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install ".[test]"
 
-      - name: Run fast tests (mocked models)
-        run: python -m pytest tests/EmbedderTest.py -v
+      # --cov=embedder measures the installed package (the code under test),
+      # --cov-branch also checks that both sides of every branch are run,
+      # term-missing lists the uncovered lines and branches in the job log.
+      - name: Run fast tests (mocked models) with coverage
+        run: python -m pytest -v --cov=embedder --cov-branch --cov-report=term-missing
+
+      # Also show the coverage table on the run's summary page. Runs even if
+      # tests failed, as long as coverage data (.coverage) was written.
+      - name: Add coverage to job summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f .coverage ]; then
+            echo "### Coverage (Python ${{ matrix.python-version }})" >> "$GITHUB_STEP_SUMMARY"
+            python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   smoke:
-    # Runs the slow test once, against a real model and real UMAP, to catch
-    # API changes in sentence-transformers or umap-learn.
+    # Runs the slow tests once, against a real model and real UMAP, to catch
+    # API changes in sentence-transformers or umap-learn, and compares the
+    # OpenVINO backend with torch.
     runs-on: ubuntu-24.04
 
     steps:
@@ -54,7 +71,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The smoke test's model ID and pinned revision live in the test file,
+      # The smoke tests' model ID and pinned revision live in the test file,
       # so the downloaded model is only re-fetched when that file changes.
       - name: Cache downloaded Hugging Face models
         uses: actions/cache@v4
@@ -62,11 +79,13 @@ jobs:
           path: ~/.cache/huggingface
           key: huggingface-${{ hashFiles('tests/EmbedderTest.py') }}
 
-      - name: Install package with test dependencies
+      # The openvino extra needs torchvision; it comes from the CPU index too,
+      # so it matches the CPU-only PyTorch.
+      - name: Install package with test and OpenVINO dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install ".[test]"
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install ".[test,openvino]"
 
-      - name: Run real-model smoke test
-        run: python -m pytest tests/EmbedderTest.py -v -m slow
+      - name: Run real-model smoke tests
+        run: python -m pytest -v -m slow

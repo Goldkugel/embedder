@@ -6,8 +6,15 @@ the YAML configuration file. Embedder.__init__ builds it from that file; it
 can also be constructed directly, e.g. to validate settings in code.
 """
 
-from typing   import Literal
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from typing     import Literal
+from pydantic   import BaseModel, ConfigDict, Field, field_validator, model_validator
+from umap.umap_ import dist as _umap_dist, pynn_named_distances as _pynn_distances
+
+# Metric names UMAP accepts for dense input (the checks in
+# UMAP._validate_parameters, which only run when a reducer is fitted, i.e.
+# after all terms have been embedded). Checked here so a typo is reported
+# when the configuration is loaded.
+umap_metrics: frozenset = frozenset(_umap_dist.named_distances) | frozenset(_pynn_distances)
 
 
 class EmbedderConfig(BaseModel):
@@ -149,7 +156,8 @@ class EmbedderConfig(BaseModel):
 
     # Distance metric used to compute proximity between embedding vectors
     # before reduction. "cosine" is recommended when embeddings are
-    # L2-normalised; "euclidean" suits raw unnormalised vectors.
+    # L2-normalised; "euclidean" suits raw unnormalised vectors. Must be a
+    # metric name UMAP knows (see umap_metrics).
     metric: str                    = "cosine"
 
     # Random seed for UMAP, ensuring that repeated runs with the same input
@@ -164,7 +172,35 @@ class EmbedderConfig(BaseModel):
         Remove empty or whitespace-only model IDs, so a placeholder entry
         in the YAML file means "no model" instead of crashing at load time.
         """
-        return [m.strip() for m in value if m.strip()]
+        model_ids = [m.strip() for m in value if m.strip()]
+        # A repeated ID would load the same model twice, while embed() could
+        # still only return one result for it.
+        duplicates = sorted({m for m in model_ids if model_ids.count(m) > 1})
+        if duplicates:
+            raise ValueError(f"model_id lists model(s) more than once: {duplicates}")
+        return model_ids
+
+    @field_validator("revision")
+    @classmethod
+    def _strip_revision_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        """
+        Strip the model IDs and revisions like the entries of model_id, so
+        the same spelling with stray spaces matches in both places.
+        """
+        return {m.strip(): r.strip() for m, r in value.items()}
+
+    @field_validator("metric")
+    @classmethod
+    def _check_metric(cls, value: str) -> str:
+        """
+        Reject metrics UMAP does not know, which UMAP itself would only
+        report in reduce(), after all terms have been embedded.
+        """
+        if value not in umap_metrics:
+            raise ValueError(
+                f"unknown UMAP metric {value!r}; use one of {sorted(umap_metrics)}"
+            )
+        return value
 
     @model_validator(mode="after")
     def _check_revision_keys(self) -> "EmbedderConfig":
