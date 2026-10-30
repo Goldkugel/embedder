@@ -114,7 +114,7 @@ class Embedder:
         # cache lookup (see the `lowercase` setting).
         self.lowercase : dict = {}
 
-        self.config, logger_path, logger_settings = Embedder._resolve_config(config)
+        self.config, logger_path, logger_settings = Embedder._resolveConfig(config)
 
         # The logger is a process-wide singleton. If the entry point has not
         # configured it yet, configure it from the same source as the
@@ -641,7 +641,7 @@ class Embedder:
         return {"backend": self.config.backend, "model_kwargs": model_kwargs}
 
     @staticmethod
-    def _resolve_config(config) -> tuple[EmbedderConfig, str | None, dict | None]:
+    def _resolveConfig(config) -> tuple[EmbedderConfig, str | None, dict | None]:
         """
         Turn the `config` argument of __init__ into an EmbedderConfig.
 
