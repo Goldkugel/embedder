@@ -733,11 +733,15 @@ class Embedder:
         if self.config.backend == "torch":
             return {}
 
-        model_kwargs = {}
+        # On CPUs with bf16 support (e.g. AVX-512 BF16 or AMX) OpenVINO
+        # computes in bf16 by default, which moves the vectors by about 1e-3.
+        # Force f32 so they match torch and can share its cache file.
+        ov_config = {"INFERENCE_PRECISION_HINT": "f32"}
         if self.config.num_threads is not None:
             # torch.set_num_threads() does not reach OpenVINO, which has its
             # own thread setting.
-            model_kwargs["ov_config"] = {"INFERENCE_NUM_THREADS": str(self.config.num_threads)}
+            ov_config["INFERENCE_NUM_THREADS"] = str(self.config.num_threads)
+        model_kwargs = {"ov_config": ov_config}
         if self.config.quantize_int8:
             # Compress the weights to 8-bit integers while converting the
             # model to OpenVINO (about twice as fast on the CPU).

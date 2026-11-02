@@ -466,7 +466,10 @@ class TestEmbedderInit:
             device       = "cpu",
             revision     = None,
             backend      = "openvino",
-            model_kwargs = {"ov_config": {"INFERENCE_NUM_THREADS": "4"}, "load_in_8bit": True},
+            model_kwargs = {
+                "ov_config"   : {"INFERENCE_PRECISION_HINT": "f32", "INFERENCE_NUM_THREADS": "4"},
+                "load_in_8bit": True,
+            },
         )
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -688,12 +691,15 @@ class TestEmbedderInit:
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_passes_openvino_backend_without_extra_settings(self, mock_st, tmp_path):
+        # Only the f32 hint: without it OpenVINO computes in bf16 on CPUs
+        # that support it, and the vectors no longer match torch.
         config_path = _write_config(tmp_path, model_id=["model-a"], backend="openvino")
 
         Embedder(config=config_path)
 
         mock_st.assert_called_once_with(
-            "model-a", device="cpu", revision=None, backend="openvino", model_kwargs={}
+            "model-a", device="cpu", revision=None, backend="openvino",
+            model_kwargs={"ov_config": {"INFERENCE_PRECISION_HINT": "f32"}},
         )
 
 
