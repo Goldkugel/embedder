@@ -130,6 +130,17 @@ _LOGGER_SETTINGS = {
 }
 
 
+def _logged(mock_logger, level=None):
+    """
+    Return the messages logged through the mocked Logger, in order, only
+    those of `level` if given ("info" is the logger's default level).
+    """
+    return [
+        c.args[0] for c in mock_logger.return_value.log.call_args_list
+        if level is None or c.kwargs.get("level", "info") == level
+    ]
+
+
 def _write_config(tmp_path, logger=None, **overrides):
     """
     Write an "embedder" section config YAML to a temp file, with
@@ -267,6 +278,8 @@ class TestEmbedderConfig:
         LoggerConfig.model_validate(data["logger"])
 
         assert config.model_id == ["cambridgeltl/SapBERT-from-PubMedBERT-fulltext"]
+        # SapBERT was trained with the [CLS] token as the term embedding.
+        assert config.pooling == "cls"
         assert set(config.revision) == set(config.model_id)
 
 
@@ -397,9 +410,31 @@ class TestEmbedderInit:
         )
 
         assert set(embedder.models) == {"model-a"}
-        # The unconfigured logger is configured from the dict's logger section.
-        assert mock_logger.config.file_name == "out.log"
-        mock_logger.assert_called_once_with()
+        # The unconfigured logger is configured from the dict's logger
+        # section, through the logger's own API.
+        mock_logger.assert_called_once_with(_LOGGER_SETTINGS)
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_passes_an_empty_logger_section_of_a_dict_as_defaults(
+        self, mock_st, mock_logger
+    ):
+        mock_logger.config = None
+
+        Embedder(config={"logger": None, "embedder": {"model_id": []}})
+
+        mock_logger.assert_called_once_with({})
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_accepts_an_empty_logger_section_in_a_file(
+        self, mock_st, mock_logger, tmp_path
+    ):
+        mock_logger.config = None
+        path = tmp_path / "config.yaml"
+        path.write_text("logger:\nembedder:\n  model_id: []\n")
+
+        Embedder(config=str(path))
+
+        mock_logger.assert_called_once_with(str(path))
 
     def test_init_rejects_unknown_keys_in_a_dict(self):
         with pytest.raises(ValidationError):
@@ -605,7 +640,7 @@ class TestEmbedderInit:
         mock_logger.config = None
         config_path = _write_config(tmp_path, model_id=["model-a"])
 
-        with pytest.raises(ValueError, match="no \\(or an empty\\) 'logger' section"):
+        with pytest.raises(ValueError, match="has no 'logger' section"):
             Embedder(config=config_path)
 
         mock_st.assert_not_called()
@@ -618,12 +653,10 @@ class TestEmbedderInit:
 
         Embedder(config=_write_config(tmp_path, model_id=["model-a"], pooling="mean"))
 
-        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        assert any(
-            "Warning: 'model-a': the configured 'mean' pooling replaces the model's own "
-            "'cls' pooling." in m
-            for m in logged
-        )
+        assert _logged(mock_logger, "warning") == [
+            "'model-a': the configured 'mean' pooling replaces the model's own "
+            "'cls' pooling."
+        ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_does_not_warn_when_pooling_is_unchanged(
@@ -633,8 +666,7 @@ class TestEmbedderInit:
 
         Embedder(config=_write_config(tmp_path, model_id=["model-a"], pooling="mean"))
 
-        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        assert not any("Warning" in m for m in logged)
+        assert _logged(mock_logger, "warning") == []
 
     @pytest.mark.parametrize("max_seq_length, accepted", [(512, True), (513, False)])
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -979,9 +1011,10 @@ class TestEmbed:
         assert fake_model.encode.call_args.args[0] == ["ccc"]
         np.testing.assert_array_equal(result["model-a"][:, 0], [1.0, 3.0])
         assert set(json.loads(cache_file.read_text())) == {"a", "bb", "ccc"}
-        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        assert f"Warning: 'model-a': cache file '{cache_file}' could only be read in " \
-               f"part; rewriting it with the 2 entries that could be read." in logged
+        assert _logged(mock_logger, "warning") == [
+            f"'model-a': cache file '{cache_file}' could only be read in part; "
+            f"rewriting it with the 2 entries that could be read."
+        ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_with_none_returns_empty_dict(self, mock_st, tmp_path):
@@ -1258,8 +1291,9 @@ class TestReduce:
         mock_umap.UMAP.return_value.fit_transform.assert_not_called()
         np.testing.assert_array_equal(result["model-a"], full["model-a"])
         mock_logger.return_value.log.assert_called_with(
-            "Warning: 'model-a': 3 row(s) given, at least 4 needed for dimensionality "
-            "reduction; returning the full-dimensional embeddings."
+            "'model-a': 3 row(s) given, at least 4 needed for dimensionality "
+            "reduction; returning the full-dimensional embeddings.",
+            level = "warning",
         )
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1529,7 +1563,8 @@ class TestLogMessages:
     """
     Tests that the log messages follow one structure: start and end of a
     step as "<Action>..." and "<Action> completed.", messages about one
-    model as "'<model_id>': ...", and warnings prefixed with "Warning: ".
+    model as "'<model_id>': ...", and warnings logged with the "warning"
+    level (the logger marks them with a [WARNING] tag).
     """
 
     @patch.object(_EMBEDDER_MODULE, "umap")
@@ -1554,12 +1589,16 @@ class TestLogMessages:
             "Loading model(s)...",
             "Loading embedding model 'model-a' (revision 'abc123', pooling 'mean', "
             "backend 'torch', device 'cpu')...",
-            "Warning: 'model-a': the configured 'mean' pooling replaces the model's own "
+            "'model-a': the configured 'mean' pooling replaces the model's own "
             "'cls' pooling.",
             "Loading embedding model 'model-a' completed (terms are lowercased).",
             "Loading model(s) completed.",
             "Creating UMAP reducer(s)...",
             "Creating UMAP reducer(s) completed.",
+        ]
+        assert _logged(mock_logger, "warning") == [
+            "'model-a': the configured 'mean' pooling replaces the model's own "
+            "'cls' pooling."
         ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1612,15 +1651,17 @@ class TestLogMessages:
         cache_file.write_text(cache_file.read_text().rstrip().rstrip("}"))
         embedder.reduce(embedder.embed(["good", "other"]))
 
-        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        warnings = [m for m in logged if m.startswith("Warning: ")]
-        # Pooling, NaN, cache repair and skipped reduction.
+        logged = _logged(mock_logger)
+        warnings = _logged(mock_logger, "warning")
+        # Pooling, NaN, cache repair and skipped reduction; every other
+        # message is logged with the default "info" level.
         assert len(warnings) == 4
+        assert len(_logged(mock_logger, "info")) == len(logged) - 4
         for message in logged:
             assert message.endswith((".", "...")), message
-            assert "Warning" not in message or message in warnings, message
+            assert not message.startswith("Warning"), message
         for message in warnings:
-            assert re.match(r"Warning: 'model-a': \S", message), message
+            assert re.match(r"'model-a': \S", message), message
         for message in logged:
             if "encoded" in message or "from cache" in message:
                 assert message.startswith("'model-a': "), message

@@ -3,7 +3,7 @@
 [`config.yaml`](./config.yaml) contains the two sections `Embedder` reads:
 
 - **`embedder`** — validated against the [`EmbedderConfig`](../src/EmbedderConfig.py) Pydantic model and documented below. Required: a file without it raises a `ValueError`.
-- **`logger`** — only read if no other part of the program has configured the [`logger`](https://github.com/Goldkugel/logger) singleton yet; in that case it is required, and a file without it raises a `ValueError` before any model is loaded. The file sets all of its fields for `logger` v1.1.0, including `encoding`; see the `logger` package's README for their meaning.
+- **`logger`** — only read if no other part of the program has configured the [`logger`](https://github.com/Goldkugel/logger) singleton yet; in that case it is required, and a file without it raises a `ValueError` before any model is loaded. The file sets all of its fields for `logger` v1.3.0, including `level`, `runtime_format` and `colors`; see the `logger` package's README for their meaning. An empty `logger:` section means the logger's defaults. Warnings (e.g. a replaced pooling, a repaired cache file) are logged with the `warning` level.
 
 When `embedder` is used inside a larger pipeline, its section can also live in a shared file next to other packages' sections; `Embedder` ignores all sections except these two.
 
@@ -17,7 +17,7 @@ embedder:
     - "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
   revision:
     "cambridgeltl/SapBERT-from-PubMedBERT-fulltext": "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
-  pooling: "mean"
+  pooling: "cls"
   cache_folder: "./data/cache/embeddings/"
   cache_decimals: 6
   progress_interval: 10000
@@ -41,7 +41,7 @@ embedder:
 |---|---|---|---|
 | `model_id` | list of strings | `[]` | Hugging Face model IDs or local paths. One `SentenceTransformer` is loaded per entry, and `embed()` returns one result per entry. Blank entries are ignored, so `- ""` means "no model"; surrounding spaces are stripped. Listing a model twice is rejected. |
 | `revision` | mapping of model ID → string | `{}` | Hugging Face revision (commit hash, branch or tag) to load per model. A commit hash makes runs reproducible even if the model is updated on the Hub. Models not listed load the latest revision; local paths need no entry. Every key must also appear in `model_id` (surrounding spaces are stripped from keys and values), so a typo cannot leave a model unpinned. |
-| `pooling` | string | `"mean"` | How the token vectors of a term are combined into one embedding: `"mean"`, `"cls"`, `"max"`, `"mean_sqrt_len_tokens"`, `"weightedmean"` or `"lasttoken"`. Applies to every configured model and replaces the pooling the model would otherwise use. `"mean"` matches what sentence-transformers does by default for plain Hugging Face models such as SapBERT; SapBERT itself was trained with `"cls"`. If a model came with a different pooling than the configured one, a warning is logged when it is loaded. |
+| `pooling` | string | `"mean"` | How the token vectors of a term are combined into one embedding: `"mean"`, `"cls"`, `"max"`, `"mean_sqrt_len_tokens"`, `"weightedmean"` or `"lasttoken"`. Applies to every configured model and replaces the pooling the model would otherwise use. `"mean"` matches what sentence-transformers does by default for plain Hugging Face models such as SapBERT; SapBERT itself was trained with `"cls"`, which `config.yaml` therefore sets. If a model came with a different pooling than the configured one, a warning is logged when it is loaded. |
 | `cache_folder` | string or `null` | `null` | Folder for the embedding cache: one JSON file per model and settings, mapping each term to its embedding. `embed()` only encodes terms not yet in the file. `null` disables caching. |
 | `cache_decimals` | integer or `null` | `6` | Decimals the cached values are rounded to. With caching enabled, `embed()` returns the rounded values too, so a later run reads back exactly the same vectors. 6 decimals change a cosine similarity by less than 1e-6 and make the file about a quarter smaller; `null` stores exact float32 values. Must be ≥ 1. |
 | `progress_interval` | integer | `10000` | Number of terms encoded between two progress messages. After each message the newly encoded terms are appended to the cache (if enabled). Must be > 0. |

@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc       import Iterable
 from sentence_transformers import SentenceTransformer
 from .EmbedderConfig       import EmbedderConfig
-from logger                import Logger, LoggerConfig
+from logger                import Logger
 import hashlib
 import json
 import os
@@ -60,6 +60,17 @@ def _to_text(term) -> str:
         # result raises; it is not a missing value, so keep its text.
         pass
     return str(term)
+
+
+def _section(data: dict, key: str) -> dict | None:
+    """
+    Return the section `key` of a parsed configuration: None if it is
+    missing, and an empty dict if it is present but empty (`logger:` with
+    nothing below it parses to None).
+    """
+    if key not in data:
+        return None
+    return data[key] or {}
 
 
 def _clean_term(term: str, lowercase: bool) -> str:
@@ -133,18 +144,19 @@ class Embedder:
         # dict. Without either, Logger() falls back to ./config/config.yaml.
         if Logger.config is None and logger_path is not None:
             # Checked here because the logger package would only raise a
-            # bare KeyError('logger').
+            # bare KeyError('logger'). An empty section is fine: the logger
+            # then uses its defaults.
             if logger_settings is None:
                 raise ValueError(
-                    f"Configuration file '{logger_path}' has no (or an empty) "
+                    f"Configuration file '{logger_path}' has no "
                     f"'{logger_section}' section, and the logger has not been "
                     f"configured yet. Add the section, or configure the logger "
                     f"first with Logger(<path>)."
                 )
             l = Logger(logger_path)
+        elif Logger.config is None and logger_settings is not None:
+            l = Logger(logger_settings)
         else:
-            if Logger.config is None and logger_settings is not None:
-                Logger.config = LoggerConfig.model_validate(logger_settings)
             l = Logger()
 
         # Limit PyTorch's CPU threads before any model runs, so a large job
@@ -185,8 +197,9 @@ class Embedder:
                     # "mean" fallback, but was trained with "cls"), but a
                     # model trained with another pooling gives worse vectors.
                     l.log(
-                        f"Warning: '{model_id}': the configured '{self.config.pooling}' "
-                        f"pooling replaces the model's own '{previous}' pooling."
+                        f"'{model_id}': the configured '{self.config.pooling}' "
+                        f"pooling replaces the model's own '{previous}' pooling.",
+                        level = "warning",
                     )
 
                 # A longer max_seq_length than the model has position
@@ -302,9 +315,10 @@ class Embedder:
                         # from the entries that could be read, so new
                         # entries can be appended.
                         Logger().log(
-                            f"Warning: '{model_name}': cache file '{cache_path}' could "
-                            f"only be read in part; rewriting it with the {len(cache)} "
-                            f"entries that could be read."
+                            f"'{model_name}': cache file '{cache_path}' could only "
+                            f"be read in part; rewriting it with the {len(cache)} "
+                            f"entries that could be read.",
+                            level = "warning",
                         )
                         Embedder.save_cache(cache_path, cache)
 
@@ -370,9 +384,10 @@ class Embedder:
                 ret[model_name] = reducer.fit_transform(vectors)
             else:
                 Logger().log(
-                    f"Warning: '{model_name}': {len(vectors)} row(s) given, at least "
+                    f"'{model_name}': {len(vectors)} row(s) given, at least "
                     f"{self.config.n_components + 2} needed for dimensionality "
-                    f"reduction; returning the full-dimensional embeddings."
+                    f"reduction; returning the full-dimensional embeddings.",
+                    level = "warning",
                 )
                 ret[model_name] = vectors
 
@@ -656,9 +671,10 @@ class Embedder:
             if invalid:
                 shown = ", ".join(repr(t) for t in invalid[:5])
                 Logger().log(
-                    f"Warning: '{model_name}': NaN or infinite values for "
+                    f"'{model_name}': NaN or infinite values for "
                     f"{len(invalid)} term(s) ({shown}{', ...' if len(invalid) > 5 else ''})"
-                    f"{'; they are not cached' if cache_path is not None else ''}."
+                    f"{'; they are not cached' if cache_path is not None else ''}.",
+                    level = "warning",
                 )
                 for term in invalid:
                     del entries[term]
@@ -735,8 +751,8 @@ class Embedder:
 
         Returns the EmbedderConfig, the YAML file it came from (or None),
         and the "logger" section of that file or of a full configuration
-        dict (or None), so __init__ can configure the logger from the same
-        source.
+        dict (an empty dict for an empty section, None if there is none),
+        so __init__ can configure the logger from the same source.
         """
         if isinstance(config, EmbedderConfig):
             return config, None, None
@@ -747,7 +763,7 @@ class Embedder:
             # kinds of dict cannot be confused.
             if configuration_section in config:
                 section = config[configuration_section] or {}
-                return EmbedderConfig.model_validate(section), None, config.get(logger_section)
+                return EmbedderConfig.model_validate(section), None, _section(config, logger_section)
             return EmbedderConfig.model_validate(config), None, None
 
         path = os.fspath(config)
@@ -764,7 +780,7 @@ class Embedder:
         return (
             EmbedderConfig.model_validate(data[configuration_section] or {}),
             path,
-            data.get(logger_section),
+            _section(data, logger_section),
         )
 
     @staticmethod
