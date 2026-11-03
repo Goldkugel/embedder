@@ -13,12 +13,12 @@ Tests cover:
   EmbedderConfig; missing, empty and invalid configuration, missing logger
   section; pooling warning, max_seq_length checked against the model;
   model loading, device, revision, backend and pooling assignment,
-  max_seq_length, CPU
-  thread limit, lowercasing decision, empty model list, logger
-  configuration, one reducer per model when dimensionality reduction is
-  enabled, none when disabled, no registries shared between instances.
+  max_seq_length, CPU thread limit, lowercasing decision, empty model
+  list, logger configuration, one reducer per model when dimensionality
+  reduction is enabled, none when disabled, no registries shared between
+  instances.
 - _apply_pooling(): pooling module replaced, other modules kept, previous
-  mode returned.
+  mode returned, error for a model without a pooling module.
 - embed(): encode parameters, per-model full-dimensional output, empty
   model list, empty or None terms, term coercion (including pandas missing
   values), whitespace collapsing and lowercasing, numpy array, tuple,
@@ -36,11 +36,13 @@ Tests cover:
 - reduce(): each model's own reducer applied, reduction skipped below
   n_components + 2 rows, error when dimensionality reduction is disabled
   or a model was not loaded.
+- Log messages: their order and structure, warnings logged with the
+  "warning" level.
 - Package exports.
 - Slow smoke tests with a real model and real UMAP (see TestRealModel).
 
-Apart from the smoke test, SentenceTransformer, UMAP and Logger are mocked,
-so no models are downloaded and no log files are written.
+Apart from the smoke tests, SentenceTransformer, UMAP and Logger are
+mocked, so no models are downloaded and no log files are written.
 
 Run from the repository root with:
     pytest -v           # fast tests only (default)
@@ -1362,7 +1364,8 @@ class TestReduce:
 
 class TestCacheFile:
     """
-    Tests for Embedder.save_cache() and Embedder.load_cache().
+    Tests for Embedder.save_cache(), Embedder.append_cache() and
+    Embedder.load_cache() (and the _read_cache() behind it).
     """
 
     def test_round_trip_is_exact_and_file_is_valid_json(self, tmp_path):
@@ -1716,7 +1719,7 @@ class TestApplyPooling:
 @pytest.mark.slow
 class TestRealModel:
     """
-    Smoke test against the real sentence-transformers and UMAP libraries,
+    Smoke tests against the real sentence-transformers and UMAP libraries,
     to catch API changes the mocked tests cannot see. Downloads a small
     model (~90 MB) on first use and runs on the CPU. Deselected by default;
     run with `pytest -m slow`.

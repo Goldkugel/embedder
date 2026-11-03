@@ -7,13 +7,13 @@ build-backend = "setuptools.build_meta"
 name = "embedder"
 description = "Configuration-driven Sentence Transformers embeddings with optional UMAP dimensionality reduction."
 readme = "README.md"
-version = "2.2.2"
+version = "2.2.3"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Peter Pallaoro", email = "peter.pallaoro@tum.de" }]
 dependencies = [
-    "logger @ git+https://github.com/Goldkugel/logger.git@v1.4.0",
+    "logger @ git+https://github.com/Goldkugel/logger.git@v1.5.0",
     "numpy>=1.24,<3",
     "pydantic>=2,<3",
     "PyYAML>=6,<7",
@@ -42,8 +42,8 @@ packages = ["embedder"]
 # default; with these settings a plain `pytest` finds them.
 testpaths = ["tests"]
 python_files = ["*Test.py"]
-# The real-model smoke test is marked "slow" and skipped by default, so a
-# plain `pytest` run needs no download; `pytest -m slow` runs only that test.
+# The real-model smoke tests are marked "slow" and skipped by default, so a
+# plain `pytest` run needs no download; `pytest -m slow` runs only those tests.
 markers = [
     "slow: downloads and runs a real model; deselected by default, run with `pytest -m slow`",
 ]

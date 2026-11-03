@@ -2,8 +2,9 @@
 Pydantic configuration model for the Embedder class.
 
 Defines and validates all settings read from the "embedder" section of
-the YAML configuration file. Embedder.__init__ builds it from that file; it
-can also be constructed directly, e.g. to validate settings in code.
+the YAML configuration file. Embedder.__init__ builds it from that file or
+from a dict; it can also be constructed directly, e.g. to validate settings
+in code.
 """
 
 from typing     import Literal

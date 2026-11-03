@@ -122,8 +122,11 @@ class Embedder:
         FileNotFoundError
             If the configuration file does not exist.
         ValueError
-            If the configuration file has no "embedder" section, or a
-            loaded model has no pooling module to configure.
+            If the configuration file has no "embedder" section; if the
+            logger still has to be configured from that file and it has no
+            "logger" section; if a loaded model has no pooling module to
+            configure; or if max_seq_length exceeds the number of positions
+            a loaded model supports.
         pydantic.ValidationError
             If the embedder settings contain unknown keys or invalid values.
         """
@@ -346,7 +349,7 @@ class Embedder:
         Each reducer is fitted afresh on every call, so the reduced
         coordinates are only comparable within one call. UMAP's spectral
         initialisation needs at least `n_components + 2` points; a model's
-        embeddings with fewer rows are returned unchanged and a message is
+        embeddings with fewer rows are returned unchanged and a warning is
         logged.
 
         Parameters
