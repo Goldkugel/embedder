@@ -181,12 +181,14 @@ class Embedder:
                 # None (no entry in the config) loads the latest revision
                 # from the Hub, or whatever a local path contains.
                 revision = self.config.revision.get(model_id)
+                # Two rows, so that a long model ID and revision hash do not
+                # make one very long row.
+                l.log(f"Loading embedding model '{model_id}'...")
                 l.log(
-                    f"Loading embedding model '{model_id}' (revision "
-                    f"'{revision or 'not pinned'}', pooling '{self.config.pooling}', "
+                    f"Revision '{revision or 'not pinned'}', pooling '{self.config.pooling}', "
                     f"backend '{self.config.backend}"
                     f"{' int8' if self.config.quantize_int8 else ''}', "
-                    f"device '{self.config.device}')..."
+                    f"device '{self.config.device}'."
                 )
                 model = SentenceTransformer(
                     model_id,
@@ -200,8 +202,8 @@ class Embedder:
                     # "mean" fallback, but was trained with "cls"), but a
                     # model trained with another pooling gives worse vectors.
                     l.log(
-                        f"'{model_id}': the configured '{self.config.pooling}' "
-                        f"pooling replaces the model's own '{previous}' pooling.",
+                        f"'{model_id}': pooling '{self.config.pooling}' replaces "
+                        f"the model's own '{previous}'.",
                         level = "warning",
                     )
 

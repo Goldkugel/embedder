@@ -659,8 +659,7 @@ class TestEmbedderInit:
         Embedder(config=_write_config(tmp_path, model_id=["model-a"], pooling="mean"))
 
         assert _logged(mock_logger, "warning") == [
-            "'model-a': the configured 'mean' pooling replaces the model's own "
-            "'cls' pooling."
+            "'model-a': pooling 'mean' replaces the model's own 'cls'."
         ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1596,18 +1595,16 @@ class TestLogMessages:
         assert [c.args[0] for c in mock_logger.return_value.log.call_args_list] == [
             "Limiting the model(s) to 2 CPU thread(s).",
             "Loading model(s)...",
-            "Loading embedding model 'model-a' (revision 'abc123', pooling 'mean', "
-            "backend 'torch', device 'cpu')...",
-            "'model-a': the configured 'mean' pooling replaces the model's own "
-            "'cls' pooling.",
+            "Loading embedding model 'model-a'...",
+            "Revision 'abc123', pooling 'mean', backend 'torch', device 'cpu'.",
+            "'model-a': pooling 'mean' replaces the model's own 'cls'.",
             "Loading embedding model 'model-a' completed (terms are lowercased).",
             "Loading model(s) completed.",
             "Creating UMAP reducer(s)...",
             "Creating UMAP reducer(s) completed.",
         ]
         assert _logged(mock_logger, "warning") == [
-            "'model-a': the configured 'mean' pooling replaces the model's own "
-            "'cls' pooling."
+            "'model-a': pooling 'mean' replaces the model's own 'cls'."
         ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1629,8 +1626,7 @@ class TestLogMessages:
         ))
 
         mock_logger.return_value.log.assert_any_call(
-            "Loading embedding model 'model-a' (revision 'not pinned', pooling 'mean', "
-            "backend 'openvino int8', device 'cpu')..."
+            "Revision 'not pinned', pooling 'mean', backend 'openvino int8', device 'cpu'."
         )
 
     @patch.object(_EMBEDDER_MODULE, "umap")
@@ -1795,7 +1791,7 @@ class TestRealModel:
         ))
 
         logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        assert any("the configured 'cls' pooling replaces the model's own 'mean'" in m
+        assert any("pooling 'cls' replaces the model's own 'mean'" in m
                    for m in logged)
 
         with pytest.raises(ValueError, match="larger than the 512 tokens"):
