@@ -1,47 +1,9 @@
 """
-Test suite for the Embedder class and EmbedderConfig model.
+Test suite for the Embedder class and EmbedderConfig model: configuration,
+model loading, embed() with its JSON cache, the cache file functions,
+reduce(), log messages and package exports.
 
-Tests cover:
-- EmbedderConfig: blank model IDs dropped, random_state=None accepted,
-  pooling default and allowed values, out-of-range values rejected,
-  revisions for unknown models rejected, backend and int8 quantisation
-  options, lowercase options, duplicate model IDs rejected, revision keys
-  stripped, UMAP metric names checked, the shipped config/config.yaml is
-  valid.
-- __init__: configuration from a YAML path (including the default path),
-  a pathlib.Path, a dict (full configuration or embedder section) or an
-  EmbedderConfig; missing, empty and invalid configuration, missing logger
-  section; pooling warning, max_seq_length checked against the model;
-  model loading, device, revision, backend and pooling assignment,
-  max_seq_length, CPU thread limit, lowercasing decision, empty model
-  list, logger configuration, one reducer per model when dimensionality
-  reduction is enabled, none when disabled, no registries shared between
-  instances.
-- _apply_pooling(): pooling module replaced, other modules kept, previous
-  mode returned, error for a model without a pooling module.
-- embed(): encode parameters, per-model full-dimensional output, empty
-  model list, empty or None terms, term coercion (including pandas missing
-  values), whitespace collapsing and lowercasing, numpy array, tuple,
-  generator, array and single-string input, duplicate terms encoded once,
-  NaN and infinite vectors returned and logged but not cached, JSON
-  cache (reuse, only missing terms encoded, rounding, repair of an
-  interrupted append, which settings start a new cache file, file names,
-  one file per model), chunked encoding with progress messages and
-  checkpoints.
-- save_cache() / append_cache() / load_cache(): exact round trip, rounding,
-  valid JSON after appends (also to a pretty-printed file), duplicates,
-  NaN and infinity refused, malformed files and entries rejected,
-  no file left half-written when a save is interrupted, complete entries
-  recovered after an interrupted append or a broken line.
-- reduce(): each model's own reducer applied, reduction skipped below
-  n_components + 2 rows, error when dimensionality reduction is disabled
-  or a model was not loaded.
-- Log messages: their order and structure, warnings logged with the
-  "warning" level.
-- Package exports.
-- Slow smoke tests with a real model and real UMAP (see TestRealModel).
-
-Apart from the smoke tests, SentenceTransformer, UMAP and Logger are
+Apart from the slow smoke tests (TestRealModel), SentenceTransformer, UMAP and Logger are
 mocked, so no models are downloaded and no log files are written.
 
 Run from the repository root with:
@@ -69,16 +31,9 @@ from logger   import LoggerConfig
 # The configuration file shipped with the repository.
 _SHIPPED_CONFIG = pathlib.Path(__file__).resolve().parents[1] / "config" / "config.yaml"
 
-# Resolve the actual module object Embedder lives in via sys.modules,
-# rather than building a dotted string like "embedder.Embedder" for @patch
-# to resolve via attribute lookup. The latter breaks here: this package's
-# __init__.py does `from .Embedder import Embedder`, which rebinds the
-# name "Embedder" inside the package namespace from "the submodule" to
-# "the class" (since the module file and the class share the same name) —
-# so patch("embedder.Embedder.SentenceTransformer") ends up resolving
-# "embedder.Embedder" to the class, not the module, and fails to find
-# SentenceTransformer on it. sys.modules[...] always returns the true
-# module object regardless of that shadowing.
+# The module object, not patch("embedder.Embedder...."): the package's
+# __init__.py rebinds "embedder.Embedder" from the submodule to the class of
+# the same name, so a dotted patch target would resolve to the class.
 _EMBEDDER_MODULE = sys.modules[Embedder.__module__]
 
 # The real pooling function, kept before the autouse fixture below replaces
@@ -168,11 +123,8 @@ def _logged(mock_logger, level=None):
 
 def _write_config(tmp_path, logger=None, **overrides):
     """
-    Write an "embedder" section config YAML to a temp file, with
-    sensible defaults for the commonly overridden fields, overridden or
-    extended by whatever the caller passes in. revision and cache_folder
-    are left at their EmbedderConfig defaults (no pin, no cache) unless
-    passed in.
+    Write a config YAML with an "embedder" section of test defaults plus
+    `overrides` to a temp file (no revision pin and no cache unless given).
 
     Parameters
     ----------
@@ -312,9 +264,8 @@ class TestEmbedderInit:
     """
     Tests for Embedder.__init__.
 
-    Verifies that models are loaded with the correct parameters, that one
-    UMAP reducer per model is created only when dimensionality_reduction is
-    True, and that an empty model list results in no SentenceTransformer calls.
+    Configuration sources, model loading parameters, and one UMAP reducer
+    per model only when dimensionality_reduction is True.
     """
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -731,12 +682,8 @@ class TestEmbed:
     """
     Tests for Embedder.embed().
 
-    Verifies that encode() is called with the correct parameters, that
-    full-dimensional results are keyed by model ID, that terms are coerced
-    to strings and encoded once each, that the JSON cache is reused and
-    only missing terms are encoded, that encoding runs in chunks with a
-    progress message and checkpoint after each, and that an empty model
-    registry or an empty terms list returns an empty dict.
+    encode() parameters, term coercion and deduplication, the JSON cache,
+    chunked encoding with checkpoints, and empty inputs.
     """
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1264,10 +1211,8 @@ class TestReduce:
     """
     Tests for Embedder.reduce().
 
-    Verifies that each model's embeddings go through that model's own
-    reducer, that inputs with fewer than n_components + 2 rows are returned
-    unreduced, and that reduce() refuses to run when dimensionality
-    reduction is disabled.
+    Each model's own reducer, small inputs returned unreduced, and the error
+    when dimensionality reduction is disabled.
     """
 
     @patch.object(_EMBEDDER_MODULE, "umap")
@@ -1594,7 +1539,7 @@ class TestLogMessages:
     """
     Tests that the log messages follow one structure: start and end of a
     step as "<Action>..." and "<Action> completed.", messages about one
-    model as "'<model_id>': ...", and warnings logged with the "warning"
+    model as "'<model name>': ..." (see getModelName()), and warnings logged with the "warning"
     level (the logger marks them with a [WARNING] tag).
     """
 
@@ -1684,8 +1629,7 @@ class TestLogMessages:
         logged = _logged(mock_logger)
         warnings = _logged(mock_logger, "warning")
         # Pooling (one row), NaN, cache repair and skipped reduction (two
-        # rows each); every other message is logged with the default "info"
-        # level.
+        # rows each); everything else is "info".
         assert len(warnings) == 7
         assert len(_logged(mock_logger, "info")) == len(logged) - 7
         _assert_task_structure(logged, tmp_path)
@@ -1696,6 +1640,20 @@ class TestLogMessages:
         for message in logged:
             if "encoded" in message or "from cache" in message:
                 assert message.startswith("'model-a': "), message
+
+
+class TestGetModelName:
+    """
+    Tests for Embedder.getModelName(), the model name in the logs.
+    """
+
+    @pytest.mark.parametrize("model_id, name", [
+        ("cambridgeltl/SapBERT-from-PubMedBERT-fulltext", "SapBERT-from-PubMedBERT-fulltext"),
+        ("model-a", "model-a"),
+        ("/models/local-model/", "local-model"),
+    ])
+    def test_returns_the_id_without_the_organisation(self, model_id, name):
+        assert Embedder.getModelName(model_id) == name
 
 
 class TestPackage:
