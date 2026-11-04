@@ -231,10 +231,10 @@ class Embedder:
                     self.lowercase[model_id] = getattr(tokenizer, "do_lower_case", None) is True
                 else:
                     self.lowercase[model_id] = self.config.lowercase
-                l.log(
-                    f"Loading embedding model '{model_id}' completed (terms are "
-                    f"{'lowercased' if self.lowercase[model_id] else 'kept cased'})."
-                )
+                # The casing is a result row of its own, before the
+                # completion row.
+                l.log(f"Terms are {'lowercased' if self.lowercase[model_id] else 'kept cased'}.")
+                l.log(f"Loading embedding model '{model_id}' completed.")
 
         l.log("Loading model(s) completed.")
 
@@ -321,7 +321,11 @@ class Embedder:
                         # entries can be appended.
                         Logger().log(
                             f"'{model_name}': cache file '{cache_path}' could only "
-                            f"be read in part; rewriting it with the {len(cache)} "
+                            f"be read in part.",
+                            level = "warning",
+                        )
+                        Logger().log(
+                            f"'{model_name}': rewriting the cache file with the {len(cache)} "
                             f"entries that could be read.",
                             level = "warning",
                         )
@@ -390,8 +394,11 @@ class Embedder:
             else:
                 Logger().log(
                     f"'{model_name}': {len(vectors)} row(s) given, at least "
-                    f"{self.config.n_components + 2} needed for dimensionality "
-                    f"reduction; returning the full-dimensional embeddings.",
+                    f"{self.config.n_components + 2} needed for dimensionality reduction.",
+                    level = "warning",
+                )
+                Logger().log(
+                    f"'{model_name}': returning the full-dimensional embeddings.",
                     level = "warning",
                 )
                 ret[model_name] = vectors
@@ -677,10 +684,14 @@ class Embedder:
                 shown = ", ".join(repr(t) for t in invalid[:5])
                 Logger().log(
                     f"'{model_name}': NaN or infinite values for "
-                    f"{len(invalid)} term(s) ({shown}{', ...' if len(invalid) > 5 else ''})"
-                    f"{'; they are not cached' if cache_path is not None else ''}.",
+                    f"{len(invalid)} term(s) ({shown}{', ...' if len(invalid) > 5 else ''}).",
                     level = "warning",
                 )
+                if cache_path is not None:
+                    Logger().log(
+                        f"'{model_name}': these term(s) are not cached.",
+                        level = "warning",
+                    )
                 for term in invalid:
                     del entries[term]
 

@@ -132,6 +132,29 @@ _LOGGER_SETTINGS = {
 }
 
 
+def _assert_task_structure(messages, tmp_path=None):
+    """
+    Check the structure of logged messages: a task starts as "<Task>..."
+    and ends as exactly "<Task> completed." (tasks may nest), every other
+    message is one sentence ending in "." (not "..."), results come as rows
+    of their own instead of being folded into the completion row, and no
+    message is much longer than 100 characters (a temporary path counts as
+    one short word).
+    """
+    open_tasks = []
+    for message in messages:
+        short = message.replace(str(tmp_path), "<tmp>") if tmp_path else message
+        assert len(short) <= 100, message
+        if message.endswith("..."):
+            open_tasks.append(message[:-len("...")])
+        elif open_tasks and message == f"{open_tasks[-1]} completed.":
+            open_tasks.pop()
+        else:
+            assert message.endswith("."), message
+            assert " completed" not in message, message
+    assert open_tasks == [], f"tasks without a completion row: {open_tasks}"
+
+
 def _logged(mock_logger, level=None):
     """
     Return the messages logged through the mocked Logger, in order, only
@@ -1019,8 +1042,8 @@ class TestEmbed:
         np.testing.assert_array_equal(result["model-a"][:, 0], [1.0, 3.0])
         assert set(json.loads(cache_file.read_text())) == {"a", "bb", "ccc"}
         assert _logged(mock_logger, "warning") == [
-            f"'model-a': cache file '{cache_file}' could only be read in part; "
-            f"rewriting it with the 2 entries that could be read."
+            f"'model-a': cache file '{cache_file}' could only be read in part.",
+            "'model-a': rewriting the cache file with the 2 entries that could be read.",
         ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
@@ -1188,8 +1211,8 @@ class TestEmbed:
         cache_file, = cache_folder.glob("*.json")
         assert set(json.loads(cache_file.read_text())) == {"good"}
         logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
-        assert any("NaN or infinite values for 1 term(s) ('bad'); they are not cached" in m
-                   for m in logged)
+        assert "'model-a': NaN or infinite values for 1 term(s) ('bad')." in logged
+        assert "'model-a': these term(s) are not cached." in logged
 
         # The next run finds an intact cache and only encodes "bad" again.
         mock_logger.return_value.log.reset_mock()
@@ -1216,6 +1239,7 @@ class TestEmbed:
         assert any(
             m.endswith("for 7 term(s) ('t0', 't1', 't2', 't3', 't4', ...).") for m in logged
         )
+        assert not any("not cached" in m for m in logged)
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_keeps_exact_values_when_cache_decimals_is_none(self, mock_st, tmp_path):
@@ -1297,11 +1321,10 @@ class TestReduce:
 
         mock_umap.UMAP.return_value.fit_transform.assert_not_called()
         np.testing.assert_array_equal(result["model-a"], full["model-a"])
-        mock_logger.return_value.log.assert_called_with(
-            "'model-a': 3 row(s) given, at least 4 needed for dimensionality "
-            "reduction; returning the full-dimensional embeddings.",
-            level = "warning",
-        )
+        assert _logged(mock_logger, "warning") == [
+            "'model-a': 3 row(s) given, at least 4 needed for dimensionality reduction.",
+            "'model-a': returning the full-dimensional embeddings.",
+        ]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_reduce_raises_when_dimensionality_reduction_disabled(self, mock_st, tmp_path):
@@ -1598,11 +1621,13 @@ class TestLogMessages:
             "Loading embedding model 'model-a'...",
             "Revision 'abc123', pooling 'mean', backend 'torch', device 'cpu'.",
             "'model-a': pooling 'mean' replaces the model's own 'cls'.",
-            "Loading embedding model 'model-a' completed (terms are lowercased).",
+            "Terms are lowercased.",
+            "Loading embedding model 'model-a' completed.",
             "Loading model(s) completed.",
             "Creating UMAP reducer(s)...",
             "Creating UMAP reducer(s) completed.",
         ]
+        _assert_task_structure(_logged(mock_logger))
         assert _logged(mock_logger, "warning") == [
             "'model-a': pooling 'mean' replaces the model's own 'cls'."
         ]
@@ -1658,12 +1683,13 @@ class TestLogMessages:
 
         logged = _logged(mock_logger)
         warnings = _logged(mock_logger, "warning")
-        # Pooling, NaN, cache repair and skipped reduction; every other
-        # message is logged with the default "info" level.
-        assert len(warnings) == 4
-        assert len(_logged(mock_logger, "info")) == len(logged) - 4
+        # Pooling (one row), NaN, cache repair and skipped reduction (two
+        # rows each); every other message is logged with the default "info"
+        # level.
+        assert len(warnings) == 7
+        assert len(_logged(mock_logger, "info")) == len(logged) - 7
+        _assert_task_structure(logged, tmp_path)
         for message in logged:
-            assert message.endswith((".", "...")), message
             assert not message.startswith("Warning"), message
         for message in warnings:
             assert re.match(r"'model-a': \S", message), message
