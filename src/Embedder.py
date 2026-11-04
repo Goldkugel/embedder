@@ -160,12 +160,11 @@ class Embedder:
                 revision = self.config.revision.get(model_id)
                 # Two rows, so a long model ID and revision hash stay readable.
                 l.log(f"Loading embedding model '{model_id}'...")
-                l.log(
-                    f"Revision '{revision or 'not pinned'}', pooling '{self.config.pooling}', "
-                    f"backend '{self.config.backend}"
-                    f"{' int8' if self.config.quantize_int8 else ''}', "
-                    f"device '{self.config.device}'."
-                )
+                l.log(f"Revision: '{revision or 'not pinned'}'.")
+                l.log(f"Pooling: '{self.config.pooling}'.")
+                l.log(f"Backend: '{self.config.backend}"
+                      f"{' int8' if self.config.quantize_int8 else ''}'.")
+                l.log(f"Device: '{self.config.device}'.")
                 model = SentenceTransformer(
                     model_id,
                     device   = self.config.device,

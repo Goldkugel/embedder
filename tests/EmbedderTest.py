@@ -1564,7 +1564,10 @@ class TestLogMessages:
             "Limiting the model(s) to 2 CPU thread(s).",
             "Loading model(s)...",
             "Loading embedding model 'model-a'...",
-            "Revision 'abc123', pooling 'mean', backend 'torch', device 'cpu'.",
+            "Revision: 'abc123'.",
+            "Pooling: 'mean'.",
+            "Backend: 'torch'.",
+            "Device: 'cpu'.",
             "'model-a': pooling 'mean' replaces the model's own 'cls'.",
             "Terms are lowercased.",
             "Loading embedding model 'model-a' completed.",
@@ -1595,9 +1598,9 @@ class TestLogMessages:
             tmp_path, model_id=["model-a"], backend="openvino", quantize_int8=True
         ))
 
-        mock_logger.return_value.log.assert_any_call(
-            "Revision 'not pinned', pooling 'mean', backend 'openvino int8', device 'cpu'."
-        )
+        logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
+        assert "Revision: 'not pinned'." in logged
+        assert "Backend: 'openvino int8'." in logged
 
     @patch.object(_EMBEDDER_MODULE, "umap")
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
