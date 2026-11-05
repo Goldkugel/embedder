@@ -219,3 +219,6 @@ __marimo__/
 
 # Embedding cache (see cache_folder in config/config.yaml)
 data/cache/
+
+# File locks of the logger (lockedFile())
+*.lock
