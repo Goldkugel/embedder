@@ -238,7 +238,8 @@ class TestEmbedderConfig:
 
     @pytest.mark.parametrize(
         "field, value",
-        [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True)],
+        [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True),
+         ("batch_size", 16), ("normalization", False)],
     )
     def test_single_per_model_value_applies_to_every_model(self, field, value):
         config = EmbedderConfig(model_id=["model-a", "model-b"], **{field: value})
@@ -248,7 +249,8 @@ class TestEmbedderConfig:
 
     @pytest.mark.parametrize(
         "field, value, default",
-        [("pooling", "cls", "mean"), ("max_seq_length", 64, 128), ("lowercase", False, "auto")],
+        [("pooling", "cls", "mean"), ("max_seq_length", 64, 128), ("lowercase", False, "auto"),
+         ("batch_size", 16, 128), ("normalization", False, True)],
     )
     def test_per_model_mapping_falls_back_to_the_default(self, field, value, default):
         config = EmbedderConfig(model_id=["model-a", "model-b"], **{field: {"model-a": value}})
@@ -257,7 +259,9 @@ class TestEmbedderConfig:
         assert config.model_setting(field, "model-b") == default
 
     @pytest.mark.parametrize(
-        "field, value", [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True)]
+        "field, value",
+        [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True),
+         ("batch_size", 16), ("normalization", False)],
     )
     def test_per_model_setting_for_unknown_model_is_rejected(self, field, value):
         with pytest.raises(ValidationError, match=f"{field} given for model\\(s\\) not in model_id"):
@@ -265,7 +269,8 @@ class TestEmbedderConfig:
 
     @pytest.mark.parametrize(
         "field, value",
-        [("pooling", "average"), ("max_seq_length", 0), ("lowercase", "sometimes")],
+        [("pooling", "average"), ("max_seq_length", 0), ("lowercase", "sometimes"),
+         ("batch_size", 0), ("normalization", "sometimes")],
     )
     def test_invalid_per_model_values_are_rejected(self, field, value):
         with pytest.raises(ValidationError):
@@ -278,7 +283,7 @@ class TestEmbedderConfig:
 
     def test_model_setting_rejects_other_fields(self):
         with pytest.raises(ValueError, match="not a per-model setting"):
-            EmbedderConfig().model_setting("batch_size", "model-a")
+            EmbedderConfig().model_setting("device", "model-a")
 
     @pytest.mark.parametrize("metric", ["cosine", "euclidean", "manhattan", "correlation"])
     def test_known_umap_metrics_are_accepted(self, metric):
@@ -725,6 +730,34 @@ class TestEmbedderInit:
         mock_st.assert_not_called()
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_warns_when_caching_an_unpinned_model(self, mock_st, mock_logger, tmp_path):
+        Embedder(config=_write_config(
+            tmp_path, model_id=["model-a", "model-b"], revision={"model-b": "abc123"},
+            cache_folder=str(tmp_path / "cache"),
+        ))
+
+        assert _logged(mock_logger, "warning") == [
+            "'model-a': revision not pinned, so an updated model would still be "
+            "served the cached vectors."
+        ]
+
+    @pytest.mark.parametrize("cached", [False, True])
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_does_not_warn_about_the_pin_without_cache_or_for_a_local_path(
+        self, mock_st, mock_logger, tmp_path, cached
+    ):
+        # Without a cache an unpinned model is not warned about; with one, a
+        # local path (one fixed version) is not either.
+        local_model = tmp_path / "local-model"
+        local_model.mkdir()
+        model_id = str(local_model) if cached else "model-a"
+        overrides = {"cache_folder": str(tmp_path / "cache")} if cached else {}
+
+        Embedder(config=_write_config(tmp_path, model_id=[model_id], **overrides))
+
+        assert _logged(mock_logger, "warning") == []
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_warns_when_pooling_replaces_the_models_own(
         self, mock_st, mock_apply_pooling, mock_logger, tmp_path
     ):
@@ -805,6 +838,24 @@ class TestEmbed:
             normalize_embeddings = False,
             convert_to_numpy     = True,
         )
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_passes_each_models_own_batch_size_and_normalization(
+        self, mock_st, tmp_path
+    ):
+        model_a, model_b = _fake_model(), _fake_model()
+        mock_st.side_effect = [model_a, model_b]
+        config_path = _write_config(
+            tmp_path, model_id=["model-a", "model-b"],
+            batch_size={"model-a": 16}, normalization={"model-b": False},
+        )
+
+        Embedder(config=config_path).embed(["term"])
+
+        assert model_a.encode.call_args.kwargs["batch_size"] == 16
+        assert model_a.encode.call_args.kwargs["normalize_embeddings"] is True
+        assert model_b.encode.call_args.kwargs["batch_size"] == 128
+        assert model_b.encode.call_args.kwargs["normalize_embeddings"] is False
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_coerces_terms_to_strings(self, mock_st, tmp_path):
@@ -1007,8 +1058,9 @@ class TestEmbed:
         cache_folder = tmp_path / "cache"
 
         for overrides in (
-            {"pooling": "cls", "max_seq_length": 64},
-            {"pooling": {"model-a": "cls"}, "max_seq_length": {"model-a": 64}},
+            {"pooling": "cls", "max_seq_length": 64, "normalization": False},
+            {"pooling": {"model-a": "cls"}, "max_seq_length": {"model-a": 64},
+             "normalization": {"model-a": False}},
         ):
             config_path = _write_config(
                 tmp_path, model_id=["model-a"], cache_folder=str(cache_folder), **overrides
@@ -1109,8 +1161,10 @@ class TestEmbed:
         fake_model = _fake_model()
         mock_st.return_value = fake_model
         cache_folder = tmp_path / "cache"
+        # Pinned, so the only warnings are about the repair.
         config_path = _write_config(
-            tmp_path, model_id=["model-a"], cache_folder=str(cache_folder)
+            tmp_path, model_id=["model-a"], revision={"model-a": "abc123"},
+            cache_folder=str(cache_folder),
         )
         Embedder(config=config_path).embed(["a", "bb"])
         cache_file, = cache_folder.glob("*.json")
@@ -1746,7 +1800,7 @@ class TestLogMessages:
         self, mock_st, mock_umap, mock_apply_pooling, mock_logger, tmp_path
     ):
         """
-        Run every path that logs (pooling warning, cache hits, progress,
+        Run every path that logs (pin and pooling warnings, cache hits, progress,
         non-finite vectors, cache repair, skipped reduction) and check the
         structure of each message.
         """
@@ -1769,10 +1823,10 @@ class TestLogMessages:
 
         logged = _logged(mock_logger)
         warnings = _logged(mock_logger, "warning")
-        # Pooling (one row), NaN, cache repair and skipped reduction (two
-        # rows each); everything else is "info".
-        assert len(warnings) == 7
-        assert len(_logged(mock_logger, "info")) == len(logged) - 7
+        # Unpinned revision and pooling (one row each), NaN, cache repair and
+        # skipped reduction (two rows each); everything else is "info".
+        assert len(warnings) == 8
+        assert len(_logged(mock_logger, "info")) == len(logged) - 8
         _assert_task_structure(logged, tmp_path)
         for message in logged:
             assert not message.startswith("Warning"), message
@@ -1924,6 +1978,46 @@ class TestRealModel:
                 tmp_path, model_id=[self.MODEL_ID], revision={self.MODEL_ID: self.REVISION},
                 max_seq_length=1024,
             ))
+
+    def test_per_model_settings_with_two_real_models(
+        self, tmp_path, mock_apply_pooling, mock_logger
+    ):
+        mock_apply_pooling.side_effect = _REAL_APPLY_POOLING
+        from huggingface_hub import snapshot_download
+        # The same weights a second time, as a local path, since model_id
+        # cannot list one ID twice. A local path needs no pinned revision.
+        local = snapshot_download(self.MODEL_ID, revision=self.REVISION)
+        config_path = _write_config(
+            tmp_path,
+            model_id       = [self.MODEL_ID, local],
+            revision       = {self.MODEL_ID: self.REVISION},
+            cache_folder   = str(tmp_path / "cache"),
+            pooling        = {local: "cls"},
+            max_seq_length = {self.MODEL_ID: 256, local: 16},
+            normalization  = {local: False},
+            batch_size     = {local: 2},
+        )
+        terms = ["Microcephaly", "Seizure", "Renal dysplasia"]
+
+        embedder = Embedder(config=config_path)
+        # all-MiniLM-L6-v2 normalizes in its own Normalize module, so the
+        # normalization setting is checked on the encode() call instead.
+        with patch.object(embedder.models[local], "encode",
+                          wraps=embedder.models[local].encode) as local_encode:
+            vectors = embedder.embed(terms)
+
+        assert embedder.models[self.MODEL_ID].max_seq_length == 256
+        assert embedder.models[local].max_seq_length == 16
+        assert local_encode.call_args.kwargs["normalize_embeddings"] is False
+        assert local_encode.call_args.kwargs["batch_size"] == 2
+        # The same weights with mean and with [CLS] pooling.
+        assert not np.allclose(vectors[local], vectors[self.MODEL_ID], atol=1e-3)
+        # One cache file per model. The only warning is about the second
+        # model's replaced pooling: the hub model is pinned and the local
+        # path needs no pin.
+        assert len(list((tmp_path / "cache").glob("*.json"))) == 2
+        warnings = _logged(mock_logger, "warning")
+        assert len(warnings) == 1 and "pooling 'cls' replaces the model's own 'mean'" in warnings[0]
 
     def test_openvino_backend_matches_torch(self, tmp_path):
         # Needs the "openvino" extra; skipped where it is not installed.

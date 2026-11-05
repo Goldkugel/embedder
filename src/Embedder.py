@@ -165,6 +165,14 @@ class Embedder:
                 # stay readable.
                 l.log(f"Loading embedding model '{model_id}'...")
                 l.log(f"Revision: '{revision or 'not pinned'}'.")
+                # A local path holds one fixed version, so it needs no pin.
+                if (revision is None and self.config.cache_folder is not None
+                        and not os.path.isdir(model_id)):
+                    l.log(
+                        f"'{Embedder.getModelName(model_id)}': revision not pinned, so an "
+                        f"updated model would still be served the cached vectors.",
+                        level = "warning",
+                    )
                 l.log(f"Pooling: '{pooling}'.")
                 l.log(f"Backend: '{self.config.backend}"
                       f"{' int8' if self.config.quantize_int8 else ''}'.")
@@ -592,15 +600,17 @@ class Embedder:
         """
         total = len(terms)
         interval = self.config.progress_interval
+        batch_size    = self.config.model_setting("batch_size", model_name)
+        normalization = self.config.model_setting("normalization", model_name)
 
         for start in range(0, total, interval):
             chunk = terms[start:start + interval]
 
             vectors = model.encode(
                 chunk,
-                batch_size           = self.config.batch_size,
+                batch_size           = batch_size,
                 show_progress_bar    = False,
-                normalize_embeddings = self.config.normalization,
+                normalize_embeddings = normalization,
                 convert_to_numpy     = True,
             )
             vectors = np.asarray(vectors, dtype=np.float32)
@@ -638,8 +648,8 @@ class Embedder:
         is disabled.
 
         The file name is the model ID plus a hash over the settings that
-        change the vectors (model ID, and the model's revision, pooling and
-        max_seq_length, normalization, int8). The backend is left out, as torch and OpenVINO
+        change the vectors (model ID, and the model's revision, pooling,
+        max_seq_length and normalization, int8). The backend is left out, as torch and OpenVINO
         without int8 agree to about 1e-6; so are lowercasing (it only changes
         the keys) and cache_decimals.
         """
@@ -652,7 +662,7 @@ class Embedder:
                 "revision"      : self.config.revision.get(model_name),
                 "pooling"       : self.config.model_setting("pooling", model_name),
                 "max_seq_length": self.config.model_setting("max_seq_length", model_name),
-                "normalization" : self.config.normalization,
+                "normalization" : self.config.model_setting("normalization", model_name),
                 # Only when enabled, so older files keep their names.
                 **({"int8": True} if self.config.quantize_int8 else {}),
             },

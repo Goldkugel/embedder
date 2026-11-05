@@ -17,12 +17,12 @@ umap_metrics: frozenset = frozenset(_umap_dist.named_distances) | frozenset(_pyn
 
 # Value types of the settings that can also be given per model.
 PoolingMode = Literal["mean", "cls", "max", "mean_sqrt_len_tokens", "weightedmean", "lasttoken"]
-SeqLength   = Annotated[int, Field(gt=0)]
+PositiveInt = Annotated[int, Field(gt=0)]
 Lowercase   = bool | Literal["auto"]
 
 # Settings that take one value for every model or a mapping from model ID
 # to value; see EmbedderConfig.model_setting().
-per_model_settings: tuple = ("pooling", "max_seq_length", "lowercase")
+per_model_settings: tuple = ("pooling", "max_seq_length", "lowercase", "batch_size", "normalization")
 
 
 class EmbedderConfig(BaseModel):
@@ -44,8 +44,9 @@ class EmbedderConfig(BaseModel):
     # must also appear in model_id.
     revision: dict[str, str]       = {}
 
-    # pooling, max_seq_length and lowercase take either one value for every
-    # model or a mapping from model ID to value, like revision. Models not in
+    # pooling, max_seq_length, lowercase, batch_size and normalization take
+    # either one value for every model or a mapping from model ID to value,
+    # like revision. Models not in
     # such a mapping get the field's default, and every key must also appear
     # in model_id.
 
@@ -94,14 +95,17 @@ class EmbedderConfig(BaseModel):
     # this is process-wide, so it affects other PyTorch code as well.
     num_threads: int | None        = Field(default=None, gt=0)
 
-    # Terms per inference batch; reduce it if you run out of memory.
-    batch_size: int                = Field(default=128, gt=0)
+    # Terms per inference batch; reduce it if you run out of memory (a
+    # larger model needs more memory per batch).
+    batch_size: PositiveInt | dict[str, PositiveInt] = 128
 
     # Maximum tokens per term; longer inputs are silently truncated.
-    max_seq_length: SeqLength | dict[str, SeqLength] = 128
+    max_seq_length: PositiveInt | dict[str, PositiveInt] = 128
 
     # L2-normalise the vectors, so a dot product equals the cosine similarity.
-    normalization: bool            = True
+    # Turn it off for models trained for the dot product of raw vectors; a
+    # model's own Normalize module still applies.
+    normalization: bool | dict[str, bool] = True
 
     # Create one UMAP reducer per model for Embedder.reduce() (e.g. for
     # plots). embed() always returns the full-dimensional vectors.
@@ -199,8 +203,8 @@ class EmbedderConfig(BaseModel):
 
     def model_setting(self, name: str, model_id: str) -> Any:
         """
-        The value of a per-model setting (pooling, max_seq_length or
-        lowercase) for one model: the single configured value, the model's
+        The value of a per-model setting (pooling, max_seq_length,
+        lowercase, batch_size or normalization) for one model: the single configured value, the model's
         entry in the mapping, or the field's default for a model not in it.
 
         Raises

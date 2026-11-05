@@ -7,9 +7,9 @@ A flexible, configuration-driven Python library for encoding textual terms into 
 - **Pydantic-validated configuration** — model selection, hardware target, and reduction parameters are all loaded and type-checked via `EmbedderConfig`.
 - **Multi-model inference** — load several Sentence Transformers models and encode the same terms with each of them in a single `embed()` call.
 - **Reproducible models** — pin each Hugging Face model to an exact revision (commit hash), so an update on the Hub cannot change your results.
-- **Per-model settings** — `pooling` (how token vectors are combined into one embedding: `mean`, `cls`, ...), `max_seq_length` and `lowercase` take one value for all models or a value per model ID, so e.g. SapBERT (trained with `cls`, the setting in `config/config.yaml`) and a mean-pooling model can be combined in one run.
+- **Per-model settings** — `pooling` (how token vectors are combined into one embedding: `mean`, `cls`, ...), `max_seq_length`, `lowercase`, `batch_size` and `normalization` take one value for all models or a value per model ID, so e.g. SapBERT (trained with `cls`, the setting in `config/config.yaml`) and a mean-pooling model can be combined in one run.
 - **Flexible configuration** — create an `Embedder` from a YAML file, a dict or an `EmbedderConfig` object.
-- **Embedding cache** — optionally keep a JSON file per model mapping each term to its embedding, so only terms not seen before are encoded. Values are rounded (6 decimals by default) to keep the files small, and whitespace variants (and, for uncased models such as SapBERT, case variants) of a term share one entry.
+- **Embedding cache** — optionally keep a JSON file per model mapping each term to its embedding, so only terms not seen before are encoded (with a warning for a model whose revision is not pinned). Values are rounded (6 decimals by default) to keep the files small, and whitespace variants (and, for uncased models such as SapBERT, case variants) of a term share one entry.
 - **Progress and checkpoints** — long runs log their progress every `progress_interval` terms and append the new embeddings to the cache, so an interrupted run resumes where it stopped. Appending keeps checkpoints fast however large the cache grows, and a file cut off by a killed job is repaired automatically.
 - **Optional dimensionality reduction** — `reduce()` projects embeddings down to 2D/3D with UMAP, for visualization or clustering. `embed()` always returns the full-dimensional vectors, which are the ones to use for similarity and matching.
 - **CPU by default** — runs on `cpu`, with an optional limit on the number of CPU threads for shared machines; `cuda` or `mps` can be configured (the value is passed straight through to Sentence Transformers).
@@ -190,7 +190,7 @@ By default, only the fast tests run. They mock `SentenceTransformer`, `umap.UMAP
 pytest -v
 ```
 
-Four slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries, check that the pooling setting takes effect, check the pooling warning and the `max_seq_length` limit against the real model, and compare the OpenVINO backend with torch (skipped unless the `openvino` extra is installed):
+Five slow smoke tests run a small real model (`all-MiniLM-L6-v2`, about 90 MB, downloaded on first use) with real UMAP on the CPU, to catch API changes in the libraries, check that the pooling setting takes effect, check the pooling warning and the `max_seq_length` limit against the real model, check different per-model settings for two models in one run (the second one is the same model loaded from its local path), and compare the OpenVINO backend with torch (skipped unless the `openvino` extra is installed):
 
 ```bash
 pytest -v -m slow
