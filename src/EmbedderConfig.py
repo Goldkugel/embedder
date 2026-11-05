@@ -7,13 +7,22 @@ from a dict; it can also be constructed directly, e.g. to validate settings
 in code.
 """
 
-from typing     import Literal
+from typing     import Annotated, Any, Literal
 from pydantic   import BaseModel, ConfigDict, Field, field_validator, model_validator
 from umap.umap_ import dist as _umap_dist, pynn_named_distances as _pynn_distances
 
 # Metric names UMAP accepts for dense input. UMAP itself only checks them when
 # a reducer is fitted, after all terms have been embedded.
 umap_metrics: frozenset = frozenset(_umap_dist.named_distances) | frozenset(_pynn_distances)
+
+# Value types of the settings that can also be given per model.
+PoolingMode = Literal["mean", "cls", "max", "mean_sqrt_len_tokens", "weightedmean", "lasttoken"]
+SeqLength   = Annotated[int, Field(gt=0)]
+Lowercase   = bool | Literal["auto"]
+
+# Settings that take one value for every model or a mapping from model ID
+# to value; see EmbedderConfig.model_setting().
+per_model_settings: tuple = ("pooling", "max_seq_length", "lowercase")
 
 
 class EmbedderConfig(BaseModel):
@@ -35,14 +44,17 @@ class EmbedderConfig(BaseModel):
     # must also appear in model_id.
     revision: dict[str, str]       = {}
 
+    # pooling, max_seq_length and lowercase take either one value for every
+    # model or a mapping from model ID to value, like revision. Models not in
+    # such a mapping get the field's default, and every key must also appear
+    # in model_id.
+
     # How token vectors are combined into one embedding, replacing every
     # model's own pooling. "mean" is sentence-transformers' fallback for plain
     # Hugging Face models, "cls" the [CLS] token (what SapBERT was trained
     # with). Use the pooling a model was trained with; a mismatch gives
     # vectors of lower quality.
-    pooling: Literal[
-        "mean", "cls", "max", "mean_sqrt_len_tokens", "weightedmean", "lasttoken"
-    ]                              = "mean"
+    pooling: PoolingMode | dict[str, PoolingMode] = "mean"
 
     # Torch device, e.g. "cpu", "cuda" or "mps".
     device: str                    = "cpu"
@@ -62,7 +74,7 @@ class EmbedderConfig(BaseModel):
     # for models whose tokenizer does anyway (uncased, e.g. SapBERT), which
     # avoids caching "Seizure" and "seizure" twice. Whitespace is always
     # collapsed.
-    lowercase: bool | Literal["auto"] = "auto"
+    lowercase: Lowercase | dict[str, Lowercase] = "auto"
 
     # Folder for the embedding cache (one JSON file per model and settings);
     # None disables it. Pin the revision when caching, or an updated model
@@ -86,7 +98,7 @@ class EmbedderConfig(BaseModel):
     batch_size: int                = Field(default=128, gt=0)
 
     # Maximum tokens per term; longer inputs are silently truncated.
-    max_seq_length: int            = Field(default=128, gt=0)
+    max_seq_length: SeqLength | dict[str, SeqLength] = 128
 
     # L2-normalise the vectors, so a dot product equals the cosine similarity.
     normalization: bool            = True
@@ -135,6 +147,17 @@ class EmbedderConfig(BaseModel):
         """
         return {m.strip(): r.strip() for m, r in value.items()}
 
+    @field_validator(*per_model_settings)
+    @classmethod
+    def _strip_per_model_keys(cls, value: Any) -> Any:
+        """
+        Strip the model IDs of a per-model mapping like the entries of
+        model_id; a single value is returned unchanged.
+        """
+        if isinstance(value, dict):
+            return {m.strip(): v for m, v in value.items()}
+        return value
+
     @field_validator("metric")
     @classmethod
     def _check_metric(cls, value: str) -> str:
@@ -149,14 +172,19 @@ class EmbedderConfig(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _check_revision_keys(self) -> "EmbedderConfig":
+    def _check_per_model_keys(self) -> "EmbedderConfig":
         """
-        Reject revisions for models that are not configured, so a typo in a
-        model ID cannot silently leave the real model unpinned.
+        Reject revisions and per-model settings for models that are not
+        configured, so a typo in a model ID cannot silently leave the real
+        model unpinned or with the default setting.
         """
-        unknown = sorted(set(self.revision) - set(self.model_id))
-        if unknown:
-            raise ValueError(f"revision given for model(s) not in model_id: {unknown}")
+        for name in ("revision", *per_model_settings):
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                continue
+            unknown = sorted(set(value) - set(self.model_id))
+            if unknown:
+                raise ValueError(f"{name} given for model(s) not in model_id: {unknown}")
         return self
 
     @model_validator(mode="after")
@@ -168,3 +196,21 @@ class EmbedderConfig(BaseModel):
         if self.quantize_int8 and self.backend != "openvino":
             raise ValueError("quantize_int8 requires backend 'openvino'")
         return self
+
+    def model_setting(self, name: str, model_id: str) -> Any:
+        """
+        The value of a per-model setting (pooling, max_seq_length or
+        lowercase) for one model: the single configured value, the model's
+        entry in the mapping, or the field's default for a model not in it.
+
+        Raises
+        ------
+        ValueError
+            If `name` is not one of the per-model settings.
+        """
+        if name not in per_model_settings:
+            raise ValueError(f"{name!r} is not a per-model setting; use one of {list(per_model_settings)}")
+        value = getattr(self, name)
+        if not isinstance(value, dict):
+            return value
+        return value.get(model_id, type(self).model_fields[name].default)

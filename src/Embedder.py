@@ -114,8 +114,8 @@ class Embedder:
             If the configuration file has no "embedder" section; if the
             logger still has to be configured from that file and it has no
             "logger" section; if a loaded model has no pooling module to
-            configure; or if max_seq_length exceeds the number of positions
-            a loaded model supports.
+            configure; or if a model's max_seq_length exceeds the number of
+            positions it supports.
         pydantic.ValidationError
             If the embedder settings contain unknown keys or invalid values.
         """
@@ -157,12 +157,15 @@ class Embedder:
         else:
             for model_id in self.config.model_id:
                 # None loads the latest revision, or whatever a local path holds.
-                revision = self.config.revision.get(model_id)
+                revision       = self.config.revision.get(model_id)
+                pooling        = self.config.model_setting("pooling", model_id)
+                max_seq_length = self.config.model_setting("max_seq_length", model_id)
+                lowercase      = self.config.model_setting("lowercase", model_id)
                 # One row per setting, so a long model ID and revision hash
                 # stay readable.
                 l.log(f"Loading embedding model '{model_id}'...")
                 l.log(f"Revision: '{revision or 'not pinned'}'.")
-                l.log(f"Pooling: '{self.config.pooling}'.")
+                l.log(f"Pooling: '{pooling}'.")
                 l.log(f"Backend: '{self.config.backend}"
                       f"{' int8' if self.config.quantize_int8 else ''}'.")
                 l.log(f"Device: '{self.config.device}'.")
@@ -172,12 +175,12 @@ class Embedder:
                     revision = revision,
                     **self._backend_arguments(),
                 )
-                previous = Embedder._apply_pooling(model, self.config.pooling)
-                if isinstance(previous, str) and previous != self.config.pooling:
+                previous = Embedder._apply_pooling(model, pooling)
+                if isinstance(previous, str) and previous != pooling:
                     # Not an error (SapBERT gets sentence-transformers' "mean"
                     # fallback but was trained with "cls"), but worse vectors.
                     l.log(
-                        f"'{Embedder.getModelName(model_id)}': pooling '{self.config.pooling}' replaces "
+                        f"'{Embedder.getModelName(model_id)}': pooling '{pooling}' replaces "
                         f"the model's own '{previous}'.",
                         level = "warning",
                     )
@@ -185,16 +188,16 @@ class Embedder:
                 # A longer max_seq_length than the model has position
                 # embeddings for would only fail once a long term arrives.
                 limit = Embedder._max_positions(model)
-                if limit is not None and self.config.max_seq_length > limit:
+                if limit is not None and max_seq_length > limit:
                     raise ValueError(
-                        f"max_seq_length {self.config.max_seq_length} is larger than "
+                        f"max_seq_length {max_seq_length} is larger than "
                         f"the {limit} tokens model '{model_id}' supports."
                     )
 
-                model.max_seq_length = self.config.max_seq_length
+                model.max_seq_length = max_seq_length
                 self.models[model_id] = model
 
-                if self.config.lowercase == "auto":
+                if lowercase == "auto":
                     # Uncased tokenizers (e.g. SapBERT) lowercase anyway, so this
                     # only avoids encoding and caching "Seizure" and "seizure"
                     # twice. `is True` keeps tokenizers without the attribute
@@ -202,7 +205,7 @@ class Embedder:
                     tokenizer = getattr(model, "tokenizer", None)
                     self.lowercase[model_id] = getattr(tokenizer, "do_lower_case", None) is True
                 else:
-                    self.lowercase[model_id] = self.config.lowercase
+                    self.lowercase[model_id] = lowercase
                 l.log(f"Terms are {'lowercased' if self.lowercase[model_id] else 'kept cased'}.")
                 l.log(f"Loading embedding model '{model_id}' completed.")
 
@@ -635,8 +638,8 @@ class Embedder:
         is disabled.
 
         The file name is the model ID plus a hash over the settings that
-        change the vectors (model ID, revision, pooling, max_seq_length,
-        normalization, int8). The backend is left out, as torch and OpenVINO
+        change the vectors (model ID, and the model's revision, pooling and
+        max_seq_length, normalization, int8). The backend is left out, as torch and OpenVINO
         without int8 agree to about 1e-6; so are lowercasing (it only changes
         the keys) and cache_decimals.
         """
@@ -647,8 +650,8 @@ class Embedder:
             {
                 "model_id"      : model_name,
                 "revision"      : self.config.revision.get(model_name),
-                "pooling"       : self.config.pooling,
-                "max_seq_length": self.config.max_seq_length,
+                "pooling"       : self.config.model_setting("pooling", model_name),
+                "max_seq_length": self.config.model_setting("max_seq_length", model_name),
                 "normalization" : self.config.normalization,
                 # Only when enabled, so older files keep their names.
                 **({"int8": True} if self.config.quantize_int8 else {}),

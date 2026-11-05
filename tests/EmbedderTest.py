@@ -236,6 +236,50 @@ class TestEmbedderConfig:
 
         assert config.revision == {"model-a": "abc123"}
 
+    @pytest.mark.parametrize(
+        "field, value",
+        [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True)],
+    )
+    def test_single_per_model_value_applies_to_every_model(self, field, value):
+        config = EmbedderConfig(model_id=["model-a", "model-b"], **{field: value})
+
+        assert config.model_setting(field, "model-a") == value
+        assert config.model_setting(field, "model-b") == value
+
+    @pytest.mark.parametrize(
+        "field, value, default",
+        [("pooling", "cls", "mean"), ("max_seq_length", 64, 128), ("lowercase", False, "auto")],
+    )
+    def test_per_model_mapping_falls_back_to_the_default(self, field, value, default):
+        config = EmbedderConfig(model_id=["model-a", "model-b"], **{field: {"model-a": value}})
+
+        assert config.model_setting(field, "model-a") == value
+        assert config.model_setting(field, "model-b") == default
+
+    @pytest.mark.parametrize(
+        "field, value", [("pooling", "cls"), ("max_seq_length", 64), ("lowercase", True)]
+    )
+    def test_per_model_setting_for_unknown_model_is_rejected(self, field, value):
+        with pytest.raises(ValidationError, match=f"{field} given for model\\(s\\) not in model_id"):
+            EmbedderConfig(model_id=["model-a"], **{field: {"model-b": value}})
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [("pooling", "average"), ("max_seq_length", 0), ("lowercase", "sometimes")],
+    )
+    def test_invalid_per_model_values_are_rejected(self, field, value):
+        with pytest.raises(ValidationError):
+            EmbedderConfig(model_id=["model-a"], **{field: {"model-a": value}})
+
+    def test_per_model_keys_are_stripped(self):
+        config = EmbedderConfig(model_id=["model-a"], pooling={" model-a ": "cls"})
+
+        assert config.pooling == {"model-a": "cls"}
+
+    def test_model_setting_rejects_other_fields(self):
+        with pytest.raises(ValueError, match="not a per-model setting"):
+            EmbedderConfig().model_setting("batch_size", "model-a")
+
     @pytest.mark.parametrize("metric", ["cosine", "euclidean", "manhattan", "correlation"])
     def test_known_umap_metrics_are_accepted(self, metric):
         assert EmbedderConfig(metric=metric).metric == metric
@@ -256,7 +300,7 @@ class TestEmbedderConfig:
 
         assert config.model_id == ["cambridgeltl/SapBERT-from-PubMedBERT-fulltext"]
         # SapBERT was trained with the [CLS] token as the term embedding.
-        assert config.pooling == "cls"
+        assert config.model_setting("pooling", config.model_id[0]) == "cls"
         assert set(config.revision) == set(config.model_id)
 
 
@@ -315,6 +359,22 @@ class TestEmbedderInit:
             ((model_a, "cls"),), ((model_b, "cls"),)
         ]
 
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_applies_each_models_own_pooling(
+        self, mock_st, mock_apply_pooling, tmp_path
+    ):
+        model_a, model_b = MagicMock(), MagicMock()
+        mock_st.side_effect = [model_a, model_b]
+        config_path = _write_config(
+            tmp_path, model_id=["model-a", "model-b"], pooling={"model-a": "cls"}
+        )
+
+        Embedder(config=config_path)
+
+        assert mock_apply_pooling.call_args_list == [
+            ((model_a, "cls"),), ((model_b, "mean"),)
+        ]
+
     @patch.object(_EMBEDDER_MODULE, "torch")
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_limits_cpu_threads_when_configured(self, mock_st, mock_torch, tmp_path):
@@ -343,6 +403,19 @@ class TestEmbedderInit:
 
         assert fake_model.max_seq_length == 256
         assert embedder.models["model-a"] is fake_model
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_sets_each_models_own_max_seq_length(self, mock_st, tmp_path):
+        model_a, model_b = MagicMock(), MagicMock()
+        mock_st.side_effect = [model_a, model_b]
+        config_path = _write_config(
+            tmp_path, model_id=["model-a", "model-b"], max_seq_length={"model-a": 64}
+        )
+
+        Embedder(config=config_path)
+
+        assert model_a.max_seq_length == 64
+        assert model_b.max_seq_length == 128
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_init_with_no_configured_models_leaves_models_empty(self, mock_st, tmp_path):
@@ -470,6 +543,33 @@ class TestEmbedderInit:
         embedder = Embedder(config=config_path)
 
         assert embedder.lowercase == {"model-a": False}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_lowercase_can_be_set_per_model(self, mock_st, tmp_path):
+        uncased, cased = MagicMock(), MagicMock()
+        uncased.tokenizer.do_lower_case = True
+        cased.tokenizer.do_lower_case   = False
+        mock_st.side_effect = [uncased, cased]
+        config_path = _write_config(
+            tmp_path, model_id=["uncased", "cased"], lowercase={"uncased": False}
+        )
+
+        embedder = Embedder(config=config_path)
+
+        # "cased" is not listed, so it keeps "auto", which follows its tokenizer.
+        assert embedder.lowercase == {"uncased": False, "cased": False}
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_init_checks_each_models_own_max_seq_length(self, mock_st, tmp_path):
+        model = MagicMock()
+        model[0].auto_model.config.max_position_embeddings = 512
+        mock_st.return_value = model
+        config_path = _write_config(
+            tmp_path, model_id=["model-a", "model-b"], max_seq_length={"model-b": 1024}
+        )
+
+        with pytest.raises(ValueError, match="1024 is larger than the 512 tokens model 'model-b'"):
+            Embedder(config=config_path)
 
     def test_init_raises_when_embedder_section_is_missing(self, tmp_path):
         path = tmp_path / "config.yaml"
@@ -896,6 +996,44 @@ class TestEmbed:
             Embedder(config=config_path).embed(["a"])
 
         assert len(list(cache_folder.glob("*.json"))) == 2
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_keeps_the_cache_file_when_a_setting_moves_into_a_mapping(
+        self, mock_st, tmp_path
+    ):
+        # The cache file depends on the value a model gets, not on how it
+        # is written, so existing caches stay valid.
+        mock_st.return_value = _fake_model()
+        cache_folder = tmp_path / "cache"
+
+        for overrides in (
+            {"pooling": "cls", "max_seq_length": 64},
+            {"pooling": {"model-a": "cls"}, "max_seq_length": {"model-a": 64}},
+        ):
+            config_path = _write_config(
+                tmp_path, model_id=["model-a"], cache_folder=str(cache_folder), **overrides
+            )
+            Embedder(config=config_path).embed(["a"])
+
+        assert len(list(cache_folder.glob("*.json"))) == 1
+
+    @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
+    def test_embed_names_each_models_cache_file_by_its_own_settings(self, mock_st, tmp_path):
+        mock_st.return_value = _fake_model()
+        cache_folder = tmp_path / "cache"
+        names = []
+
+        # model-b's settings change, model-a's stay the same.
+        for pooling in ({"model-a": "cls"}, {"model-a": "cls", "model-b": "cls"}):
+            config_path = _write_config(
+                tmp_path, model_id=["model-a", "model-b"],
+                cache_folder=str(cache_folder), pooling=pooling,
+            )
+            embedder = Embedder(config=config_path)
+            names.append({m: embedder._cache_path(m) for m in ("model-a", "model-b")})
+
+        assert names[0]["model-a"] == names[1]["model-a"]
+        assert names[0]["model-b"] != names[1]["model-b"]
 
     @patch.object(_EMBEDDER_MODULE, "SentenceTransformer")
     def test_embed_writes_no_cache_when_cache_folder_is_unset(self, mock_st, tmp_path):

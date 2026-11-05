@@ -7,7 +7,7 @@ A flexible, configuration-driven Python library for encoding textual terms into 
 - **Pydantic-validated configuration** — model selection, hardware target, and reduction parameters are all loaded and type-checked via `EmbedderConfig`.
 - **Multi-model inference** — load several Sentence Transformers models and encode the same terms with each of them in a single `embed()` call.
 - **Reproducible models** — pin each Hugging Face model to an exact revision (commit hash), so an update on the Hub cannot change your results.
-- **Configurable pooling** — choose how token vectors are combined into one embedding (`mean`, `cls`, ...), e.g. `cls` to match how SapBERT was trained (the setting in `config/config.yaml`).
+- **Per-model settings** — `pooling` (how token vectors are combined into one embedding: `mean`, `cls`, ...), `max_seq_length` and `lowercase` take one value for all models or a value per model ID, so e.g. SapBERT (trained with `cls`, the setting in `config/config.yaml`) and a mean-pooling model can be combined in one run.
 - **Flexible configuration** — create an `Embedder` from a YAML file, a dict or an `EmbedderConfig` object.
 - **Embedding cache** — optionally keep a JSON file per model mapping each term to its embedding, so only terms not seen before are encoded. Values are rounded (6 decimals by default) to keep the files small, and whitespace variants (and, for uncased models such as SapBERT, case variants) of a term share one entry.
 - **Progress and checkpoints** — long runs log their progress every `progress_interval` terms and append the new embeddings to the cache, so an interrupted run resumes where it stopped. Appending keeps checkpoints fast however large the cache grows, and a file cut off by a killed job is repaired automatically.
@@ -78,7 +78,8 @@ embedder:
     - "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
   revision:
     "cambridgeltl/SapBERT-from-PubMedBERT-fulltext": "090663c3ae57bf35ffe4d0d468a2a88d03051a4d"
-  pooling: "cls"
+  pooling:
+    "cambridgeltl/SapBERT-from-PubMedBERT-fulltext": "cls"
   cache_folder: "./data/cache/embeddings/"
   cache_decimals: 6
   progress_interval: 10000
