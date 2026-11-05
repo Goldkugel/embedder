@@ -116,7 +116,8 @@ class EmbedderConfig(BaseModel):
     def _drop_blank_model_ids(cls, value: list[str]) -> list[str]:
         """
         Remove empty or whitespace-only model IDs, so a placeholder entry
-        in the YAML file means "no model" instead of crashing at load time.
+        in the YAML file means "no model" instead of crashing at load time,
+        and reject duplicate IDs.
         """
         model_ids = [m.strip() for m in value if m.strip()]
         # embed() could only return one result for a repeated ID.

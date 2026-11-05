@@ -158,7 +158,8 @@ class Embedder:
             for model_id in self.config.model_id:
                 # None loads the latest revision, or whatever a local path holds.
                 revision = self.config.revision.get(model_id)
-                # Two rows, so a long model ID and revision hash stay readable.
+                # One row per setting, so a long model ID and revision hash
+                # stay readable.
                 l.log(f"Loading embedding model '{model_id}'...")
                 l.log(f"Revision: '{revision or 'not pinned'}'.")
                 l.log(f"Pooling: '{self.config.pooling}'.")
@@ -368,9 +369,9 @@ class Embedder:
         Write a complete embedding cache to a JSON file.
 
         The file is written to `<path>.tmp` and then renamed, so a killed
-        process never leaves `path` half-written. It is a JSON object with
-        one term per line, so load_cache() can read it line by line and
-        append_cache() can extend it cheaply.
+        process never leaves `path` half-written. It holds one term per line,
+        so load_cache() can read it line by line and append_cache() can
+        extend it cheaply.
 
         Parameters
         ----------
@@ -500,6 +501,8 @@ class Embedder:
             cache, closed, broken_lines = {}, False, 0
             with open(path, "r", encoding="utf-8") as f:
                 f.readline()
+                # Each line is one `"term": [...]` pair; in braces it is a
+                # JSON object of its own.
                 for line in f:
                     line = line.strip().rstrip(",")
                     if line == "":

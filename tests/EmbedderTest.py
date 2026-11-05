@@ -927,7 +927,7 @@ class TestEmbed:
 
         chunks = [c.args[0] for c in fake_model.encode.call_args_list]
         assert chunks == [["a", "b"], ["c", "d"], ["e"]]
-        # Each checkpoint appends only the terms of its own chunk.
+        # Each append adds only the terms of its own chunk.
         appended = [list(c.args[1]) for c in mock_append.call_args_list]
         assert appended == [["a", "b"], ["c", "d"], ["e"]]
         logged = [c.args[0] for c in mock_logger.return_value.log.call_args_list]
